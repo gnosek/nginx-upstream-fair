@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2007 Grzegorz Nosek
- * Work sponsored by Ezra Zygmuntowicz
+ * Work sponsored by Ezra Zygmuntowicz & EngineYard.com
  *
  * Based on nginx source (C) Igor Sysoev
  */
@@ -31,6 +31,13 @@ typedef struct {
 } ngx_http_upstream_fair_peer_data_t;
 
 
+typedef struct ngx_http_upstream_fair_shm_link_s {
+    ngx_shm_t                                   shm;
+    struct ngx_http_upstream_fair_shm_link_s   *next;
+} ngx_http_upstream_fair_shm_link_t;
+
+
+static ngx_int_t ngx_http_upstream_fair_init_module(ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_upstream_init_fair(ngx_conf_t *cf,
     ngx_http_upstream_srv_conf_t *us);
 static ngx_int_t ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc,
@@ -77,7 +84,7 @@ ngx_module_t  ngx_http_upstream_fair_module = {
     ngx_http_upstream_fair_commands,    /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
     NULL,                                  /* init master */
-    NULL,                                  /* init module */
+    ngx_http_upstream_fair_init_module,    /* init module */
     NULL,                                  /* init process */
     NULL,                                  /* init thread */
     NULL,                                  /* exit thread */
@@ -86,6 +93,25 @@ ngx_module_t  ngx_http_upstream_fair_module = {
     NGX_MODULE_V1_PADDING
 };
 
+
+/* this isn't very pretty, but nginx's shm_zones aren't, either */
+static ngx_http_upstream_fair_shm_link_t *shm_list;
+
+static ngx_int_t
+ngx_http_upstream_fair_init_module(ngx_cycle_t *cycle)
+{
+    ngx_http_upstream_fair_shm_link_t *link = shm_list, *prev;
+
+    while (link) {
+        prev = link;
+        link = link->next;
+        ngx_shm_free(&prev->shm);
+        free(prev);
+    }
+
+    shm_list = NULL;
+    return NGX_OK;
+}
 
 static char *
 ngx_http_upstream_fair(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
@@ -111,7 +137,7 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
 {
     ngx_http_upstream_fair_peers_t     *peers;
     ngx_uint_t                          n;
-    ngx_shm_t                           shm;
+    ngx_http_upstream_fair_shm_link_t  *shm_link;
 
     /* do the dirty work using rr module */
     if (ngx_http_upstream_init_round_robin(cf, us) != NGX_OK) {
@@ -126,15 +152,25 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     peers->rrp = us->peer.data;
     n = peers->rrp->number;
 
-    shm.size = n * sizeof(ngx_http_upstream_fair_shared_t);
-    shm.log = cf->log;
-
-    /* TODO: find a good place to free it (will probably leak on reload) */
-    if (ngx_shm_alloc(&shm) != NGX_OK) {
+    /* a plain malloc, not nginx's pool allocator functions */
+    shm_link = malloc(sizeof *shm_link);
+    if (!shm_link) {
         return NGX_ERROR;
     }
-    peers->shared = (ngx_http_upstream_fair_shared_t *)shm.addr;
-    ngx_memset(peers->shared, 0, shm.size);
+
+    shm_link->shm.size = n * sizeof(ngx_http_upstream_fair_shared_t);
+    shm_link->shm.log = cf->log;
+
+    if (ngx_shm_alloc(&shm_link->shm) != NGX_OK) {
+        free(shm_link);
+        return NGX_ERROR;
+    }
+
+    shm_link->next = shm_list;
+    shm_list = shm_link;
+
+    peers->shared = (ngx_http_upstream_fair_shared_t *)shm_link->shm.addr;
+    ngx_memset(peers->shared, 0, shm_link->shm.size);
 
     us->peer.init = ngx_http_upstream_init_fair_peer;
 
