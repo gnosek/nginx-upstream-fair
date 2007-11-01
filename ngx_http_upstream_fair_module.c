@@ -150,6 +150,7 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
         return NGX_ERROR;
     }
     peers->rrp = us->peer.data;
+    us->peer.data = peers;
     n = peers->rrp->number;
 
     /* a plain malloc, not nginx's pool allocator functions */
