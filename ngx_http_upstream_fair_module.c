@@ -19,15 +19,14 @@
  */
 #define FS_TIME_SLOTS 4
 
+#define FS_UNPADDED_SIZE (2 * sizeof(ngx_atomic_t) + FS_TIME_SLOTS * sizeof(ngx_msec_t))
+#define FS_STRUCT_SIZE (ngx_align( FS_UNPADDED_SIZE, CACHELINE_SIZE))
+
 typedef struct {
     ngx_atomic_t                        nreq;
     ngx_atomic_t                        slot;
     volatile ngx_msec_t                 last_active[FS_TIME_SLOTS];
-    unsigned char                       padding[
-                                            CACHELINE_SIZE -
-                                            2 * sizeof(ngx_atomic_t) -
-                                            FS_TIME_SLOTS * sizeof(ngx_msec_t)
-                                        ];
+    unsigned char                       padding[FS_STRUCT_SIZE - FS_UNPADDED_SIZE];
 } ngx_http_upstream_fair_shared_t;
 
 
