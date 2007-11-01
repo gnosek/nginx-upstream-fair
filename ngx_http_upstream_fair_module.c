@@ -11,11 +11,23 @@
 
 #define CACHELINE_SIZE 64
 
+/*
+ * this must be a power of two as we rely on integer wrap around
+ *
+ * it should also be small enough to make the whole struct fit in
+ * a single cacheline
+ */
+#define FS_TIME_SLOTS 4
+
 typedef struct {
-    ngx_atomic_t                        lock;
-    ngx_msec_t                          last_active;
-    int                                 nreq;
-    unsigned char                       padding[ CACHELINE_SIZE - sizeof(ngx_atomic_t) - sizeof(ngx_msec_t) - sizeof(int) ];
+    ngx_atomic_t                        nreq;
+    ngx_atomic_t                        slot;
+    volatile ngx_msec_t                 last_active[FS_TIME_SLOTS];
+    unsigned char                       padding[
+                                            CACHELINE_SIZE -
+                                            2 * sizeof(ngx_atomic_t) -
+                                            FS_TIME_SLOTS * sizeof(ngx_msec_t)
+                                        ];
 } ngx_http_upstream_fair_shared_t;
 
 
@@ -146,21 +158,42 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     return NGX_OK;
 }
 
+
+static void
+ngx_http_upstream_fair_update_nreq(ngx_http_upstream_fair_peer_data_t *fp, int delta)
+{
+    ngx_http_upstream_fair_shared_t     *fs;
+    ngx_uint_t                           slot;
+
+    fs = &fp->shared[fp->rrpd.current];
+
+    ngx_atomic_fetch_add(&fs->nreq, delta);
+    slot = ngx_atomic_fetch_add(&fs->slot, 1) % FS_TIME_SLOTS;
+
+    fs->last_active[slot] = ngx_current_msec;
+}
+
+
 /*
  * the two methods below are the core of load balancing logic
  *
- * for now, just pass through to round robin
+ * for now, just pass through to round robin and collect some
+ * statistics
  */
 
 ngx_int_t
 ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
 {
+    ngx_int_t                            ret;
+
     /*
      * ngx_http_upstream_rr_peer_data_t is the first member,
      * so just passing data is safe
      */
 
-    return ngx_http_upstream_get_round_robin_peer(pc, data);
+    ret = ngx_http_upstream_get_round_robin_peer(pc, data);
+    ngx_http_upstream_fair_update_nreq(data, 1);
+    return ret;
 }
 
 
@@ -168,6 +201,7 @@ void
 ngx_http_upstream_free_fair_peer(ngx_peer_connection_t *pc, void *data,
     ngx_uint_t state)
 {
+    ngx_http_upstream_fair_update_nreq(data, -1);
     ngx_http_upstream_free_round_robin_peer(pc, data, state);
 }
 
