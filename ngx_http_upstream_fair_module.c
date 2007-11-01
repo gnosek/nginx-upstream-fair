@@ -20,6 +20,7 @@ typedef struct {
 
 
 typedef struct {
+    ngx_shm_zone_t                     *shm_zone;
     ngx_http_upstream_fair_shared_t    *shared;
     ngx_http_upstream_rr_peers_t       *rrp;
 } ngx_http_upstream_fair_peers_t;
@@ -29,12 +30,6 @@ typedef struct {
     ngx_http_upstream_rr_peer_data_t   rrpd;
     ngx_http_upstream_fair_shared_t   *shared;
 } ngx_http_upstream_fair_peer_data_t;
-
-
-typedef struct ngx_http_upstream_fair_shm_link_s {
-    ngx_shm_t                                   shm;
-    struct ngx_http_upstream_fair_shm_link_s   *next;
-} ngx_http_upstream_fair_shm_link_t;
 
 
 static ngx_int_t ngx_http_upstream_fair_init_module(ngx_cycle_t *cycle);
@@ -84,7 +79,7 @@ ngx_module_t  ngx_http_upstream_fair_module = {
     ngx_http_upstream_fair_commands,    /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
     NULL,                                  /* init master */
-    ngx_http_upstream_fair_init_module,    /* init module */
+    NULL,                                  /* init module */
     NULL,                                  /* init process */
     NULL,                                  /* init thread */
     NULL,                                  /* exit thread */
@@ -94,22 +89,9 @@ ngx_module_t  ngx_http_upstream_fair_module = {
 };
 
 
-/* this isn't very pretty, but nginx's shm_zones aren't, either */
-static ngx_http_upstream_fair_shm_link_t *shm_list;
-
 static ngx_int_t
-ngx_http_upstream_fair_init_module(ngx_cycle_t *cycle)
+ngx_http_upstream_fair_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
 {
-    ngx_http_upstream_fair_shm_link_t *link = shm_list, *prev;
-
-    while (link) {
-        prev = link;
-        link = link->next;
-        ngx_shm_free(&prev->shm);
-        free(prev);
-    }
-
-    shm_list = NULL;
     return NGX_OK;
 }
 
@@ -137,7 +119,6 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
 {
     ngx_http_upstream_fair_peers_t     *peers;
     ngx_uint_t                          n;
-    ngx_http_upstream_fair_shm_link_t  *shm_link;
 
     /* do the dirty work using rr module */
     if (ngx_http_upstream_init_round_robin(cf, us) != NGX_OK) {
@@ -153,25 +134,12 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     us->peer.data = peers;
     n = peers->rrp->number;
 
-    /* a plain malloc, not nginx's pool allocator functions */
-    shm_link = malloc(sizeof *shm_link);
-    if (!shm_link) {
+    peers->shm_zone = ngx_shared_memory_add(cf, peers->rrp->name, 8 * ngx_pagesize, &ngx_http_upstream_fair_module);
+    if (peers->shm_zone == NULL) {
         return NGX_ERROR;
     }
-
-    shm_link->shm.size = n * sizeof(ngx_http_upstream_fair_shared_t);
-    shm_link->shm.log = cf->log;
-
-    if (ngx_shm_alloc(&shm_link->shm) != NGX_OK) {
-        free(shm_link);
-        return NGX_ERROR;
-    }
-
-    shm_link->next = shm_list;
-    shm_list = shm_link;
-
-    peers->shared = (ngx_http_upstream_fair_shared_t *)shm_link->shm.addr;
-    ngx_memset(peers->shared, 0, shm_link->shm.size);
+    peers->shm_zone->init = ngx_http_upstream_fair_init_shm_zone;
+    peers->shared = NULL;
 
     us->peer.init = ngx_http_upstream_init_fair_peer;
 
@@ -208,10 +176,12 @@ ngx_int_t
 ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
     ngx_http_upstream_srv_conf_t *us)
 {
-    ngx_http_upstream_fair_peer_data_t *fp;
-    ngx_http_upstream_fair_peers_t *usfp;
+    ngx_http_upstream_fair_peer_data_t     *fp;
+    ngx_http_upstream_fair_peers_t         *usfp;
+    ngx_slab_pool_t                        *shpool;
 
     fp = r->upstream->peer.data;
+
     if (fp == NULL) {
         fp = ngx_palloc(r->pool, sizeof(ngx_http_upstream_fair_peer_data_t));
         if (fp == NULL) {
@@ -228,11 +198,21 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
+    /* restore saved usfp pointer */
     us->peer.data = usfp;
-    fp->shared = usfp->shared;
 
-    r->upstream->peer.get = ngx_http_upstream_get_fair_peer;
-    r->upstream->peer.free = ngx_http_upstream_free_fair_peer;
+    /* set up shared memory area */
+    shpool = (ngx_slab_pool_t *)usfp->shm_zone->shm.addr;
+
+    if (!usfp->shared) {
+        usfp->shared = ngx_slab_alloc(shpool, usfp->rrp->number * sizeof(ngx_http_upstream_fair_shared_t));
+    }
+
+    if (usfp->shared) {
+        fp->shared = usfp->shared;
+        r->upstream->peer.get = ngx_http_upstream_get_fair_peer;
+        r->upstream->peer.free = ngx_http_upstream_free_fair_peer;
+    } /* else just fallback on round-robin behaviour */
 
     /* keep the rest of configuration from rr, including e.g. SSL sessions */
 
