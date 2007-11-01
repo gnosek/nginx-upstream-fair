@@ -174,16 +174,90 @@ ngx_http_upstream_fair_update_nreq(ngx_http_upstream_fair_peer_data_t *fp, int d
 
 
 /*
- * the two methods below are the core of load balancing logic
+ * should probably be comparable to average request processing
+ * time, including the occasional hogs
  *
- * for now, just pass through to round robin and collect some
- * statistics
+ * it's probably better to keep this estimate pessimistic
+ */
+#define FS_TIME_SCALE_OFFSET 1000
+
+static ngx_inline
+ngx_int_t ngx_http_upstream_fair_peer_is_down(
+    ngx_http_upstream_rr_peer_t *peer, time_t now)
+{
+    if (peer->down) {
+        return 1;
+    }
+
+    if (peer->max_fails == 0
+        || peer->fails < peer->max_fails)
+    {
+        return 0;
+    }
+
+    if (now - peer->accessed > peer->fail_timeout) {
+        peer->fails = 0;
+        return 0;
+    }
+
+    return 1;
+}
+
+static ngx_int_t
+ngx_http_upstream_fair_sched_score(ngx_peer_connection_t *pc,
+    ngx_http_upstream_fair_shared_t *fs,
+    ngx_http_upstream_rr_peer_t *peer)
+{
+    ngx_int_t                           slot;
+    ngx_msec_t                          last_active_delta;
+
+    slot = (fs->slot - 1) % FS_TIME_SLOTS;
+    last_active_delta = ngx_current_msec - fs->last_active[slot];
+    if ((ngx_int_t) last_active_delta < 0) {
+        ngx_log_error(NGX_LOG_WARN, pc->log, 0, "[rr ] Clock skew of at least %i msec detected", -(ngx_int_t) last_active_delta);
+
+        /* a pretty arbitrary value */
+        last_active_delta = FS_TIME_SCALE_OFFSET;
+    }
+
+    /*
+     * should be pretty unlikely to process a request for many days and still not time out,
+     * or to become swamped with requests this heavily; still, we shouldn't drop this backend
+     * completely as it wouldn't ever get a chance to recover
+     */
+    if (fs->nreq > 1 && last_active_delta > 0 && (INT_MAX / ( last_active_delta + FS_TIME_SCALE_OFFSET )) < fs->nreq - 1) {
+        ngx_log_error(NGX_LOG_WARN, pc->log, 0, "Upstream %V has been active for %lu seconds",
+            &peer->name, last_active_delta / 1000);
+
+        /*
+         * schedule behind "sane" backends with the same number of requests pending
+         * but (hopefully) before backends with more requests
+         */
+        return -fs->nreq * FS_TIME_SCALE_OFFSET;
+    } else {
+        return (1 - fs->nreq) * (last_active_delta + FS_TIME_SCALE_OFFSET);
+    }
+}
+
+/*
+ * the two methods below are the core of load balancing logic
  */
 
 ngx_int_t
 ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
 {
-    ngx_int_t                            ret;
+    ngx_int_t                           ret;
+    ngx_http_upstream_fair_peer_data_t *fp = data;
+    ngx_http_upstream_fair_shared_t    *fs;
+    ngx_http_upstream_fair_shared_t     fsc;
+
+    ngx_int_t                           first_sched_score = INT_MIN;
+    ngx_int_t                           sched_score = INT_MIN;
+    ngx_int_t                           prev_sched_score = INT_MIN;
+    time_t                              now;
+    ngx_uint_t                          i;
+    ngx_uint_t                          first_peer;
+    ngx_uint_t                          next_peer;
 
     /*
      * ngx_http_upstream_rr_peer_data_t is the first member,
@@ -191,6 +265,93 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
      */
 
     ret = ngx_http_upstream_get_round_robin_peer(pc, data);
+    if (ret != NGX_OK) {
+        return ret;
+    }
+
+    now = ngx_time();
+
+    first_peer = fp->rrpd.current;
+    for (i = 0; i < fp->rrpd.peers->number; i++) {
+        fs = &fp->shared[fp->rrpd.current];
+
+        /* the fast path -- current backend is idle */
+        if (ngx_atomic_fetch_add(&fs->nreq, 0) == 0)
+            break;
+
+        /* keep a local copy -- TODO: proper locking */
+        fsc = *fs;
+
+        /* calculate scheduler score for currently selected backend */
+        sched_score = ngx_http_upstream_fair_sched_score(pc, &fsc,
+            &fp->rrpd.peers->peer[fp->rrpd.current]);
+
+        /* keep the first score for logging purposes */
+        if (!i) {
+            first_sched_score = sched_score;
+        }
+
+        /*
+         * the new score isn't any better than the old one, roll back to the
+         * previous backend
+         *
+         * we roll back also when the score is equal to keep close to the round
+         * robin model where it makes sense
+         */
+        if (sched_score <= prev_sched_score) {
+            ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] i=%i, %i <= %i, rolling back", i, sched_score, prev_sched_score);
+
+            /* the last change was bad, roll it back */
+            sched_score = prev_sched_score;
+            if (fp->rrpd.current == 0) {
+                fp->rrpd.current = fp->rrpd.peers->number - 1;
+            } else {
+                fp->rrpd.current--;
+            }
+            /* don't look any further for two reasons:
+             * 1. as we're "almost" round robin, it's unlikely that there are much
+             *    better backends futher down the list
+             * 2. we don't want the cache lines to bounce too much (they're already
+             *    quite hot)
+             */
+            break;
+        }
+
+        /* check the next peer */
+        next_peer = fp->rrpd.current + 1;
+        if (next_peer >= fp->rrpd.peers->number) {
+            next_peer = 0;
+        }
+        fp->rrpd.current = next_peer;
+        prev_sched_score = sched_score;
+
+        if (ngx_http_upstream_fair_peer_is_down(&fp->rrpd.peers->peer[fp->rrpd.current], now)) {
+            /* should probably use fancier logic, but for now it'll do */
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] next peer %ui is down", next_peer);
+            break;
+        }
+    }
+
+    /*
+     * tell the upstream core to use the new backend
+     * and advance the "current peer" for the next run of round-robin
+     */
+    if (first_peer != fp->rrpd.current) {
+        ngx_http_upstream_rr_peer_t *peer = &fp->rrpd.peers->peer[fp->rrpd.current];
+        ngx_uint_t next_peer = fp->rrpd.current + 1;
+        if (next_peer >= fp->rrpd.peers->number) {
+            next_peer = 0;
+        }
+
+        pc->sockaddr = peer->sockaddr;
+        pc->socklen = peer->socklen;
+        pc->name = &peer->name;
+        fp->rrpd.peers->current = next_peer;
+
+        ngx_log_debug5(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] sched_score [%ui] %i -> [%ui] %i in %ui iterations",
+            first_peer, first_sched_score, fp->rrpd.current, sched_score, i);
+    }
+
     ngx_http_upstream_fair_update_nreq(data, 1);
     return ret;
 }
@@ -238,7 +399,14 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
     shpool = (ngx_slab_pool_t *)usfp->shm_zone->shm.addr;
 
     if (!usfp->shared) {
+        ngx_uint_t i;
+        time_t now = ngx_time();
         usfp->shared = ngx_slab_alloc(shpool, usfp->rrp->number * sizeof(ngx_http_upstream_fair_shared_t));
+        for (i = 0; i < usfp->rrp->number; i++) {
+                usfp->shared[i].nreq = 0;
+                usfp->shared[i].slot = 0;
+                usfp->shared[i].last_active[0] = now;
+        }
     }
 
     if (usfp->shared) {
