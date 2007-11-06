@@ -338,15 +338,10 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
      */
     if (first_peer != fp->rrpd.current) {
         ngx_http_upstream_rr_peer_t *peer = &fp->rrpd.peers->peer[fp->rrpd.current];
-        ngx_uint_t next_peer = fp->rrpd.current + 1;
-        if (next_peer >= fp->rrpd.peers->number) {
-            next_peer = 0;
-        }
 
         pc->sockaddr = peer->sockaddr;
         pc->socklen = peer->socklen;
         pc->name = &peer->name;
-        fp->rrpd.peers->current = next_peer;
 
         ngx_log_debug5(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] sched_score [%ui] %i -> [%ui] %i in %ui iterations",
             first_peer, first_sched_score, fp->rrpd.current, sched_score, i);
