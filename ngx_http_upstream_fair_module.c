@@ -446,7 +446,7 @@ ngx_http_upstream_free_fair_peer(ngx_peer_connection_t *pc, void *data,
 
         weight_delta = peer->weight / peer->max_fails;
 
-        if (peer->current_weight < weight_delta) {
+        if ((ngx_uint_t) peer->current_weight < weight_delta) {
             peer->current_weight = 0;
         } else {
             peer->current_weight -= weight_delta;
