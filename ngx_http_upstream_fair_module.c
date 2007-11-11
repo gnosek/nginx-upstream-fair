@@ -230,7 +230,7 @@ ngx_http_upstream_fair_sched_score(ngx_peer_connection_t *pc,
          */
         return -fs->nreq * FS_TIME_SCALE_OFFSET;
     } else {
-        return (1 - fs->nreq) * (last_active_delta + FS_TIME_SCALE_OFFSET);
+        return (1 - fs->nreq) * FS_TIME_SCALE_OFFSET + last_active_delta;
     }
 }
 
