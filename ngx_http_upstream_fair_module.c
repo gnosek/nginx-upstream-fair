@@ -31,7 +31,6 @@ typedef struct {
 
 
 typedef struct {
-    ngx_shm_zone_t                     *shm_zone;
     ngx_http_upstream_fair_shared_t    *shared;
     ngx_http_upstream_rr_peers_t       *rrp;
     ngx_uint_t                         current;
@@ -106,6 +105,9 @@ ngx_module_t  ngx_http_upstream_fair_module = {
 };
 
 
+static ngx_shm_zone_t * ngx_http_upstream_fair_shm_zone;
+
+
 static ngx_int_t
 ngx_http_upstream_fair_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
 {
@@ -136,6 +138,7 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
 {
     ngx_http_upstream_fair_peers_t     *peers;
     ngx_uint_t                          n;
+    ngx_str_t                          *shm_name;
 
     /* do the dirty work using rr module */
     if (ngx_http_upstream_init_round_robin(cf, us) != NGX_OK) {
@@ -151,11 +154,18 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     us->peer.data = peers;
     n = peers->rrp->number;
 
-    peers->shm_zone = ngx_shared_memory_add(cf, peers->rrp->name, 8 * ngx_pagesize, &ngx_http_upstream_fair_module);
-    if (peers->shm_zone == NULL) {
+    shm_name = ngx_palloc(cf->pool, sizeof *shm_name);
+    shm_name->len = sizeof("upstream_fair");
+    shm_name->data = (unsigned char *) "upstream_fair";
+
+    /* TODO configurable shm size for large installations */
+    ngx_http_upstream_fair_shm_zone = ngx_shared_memory_add(
+        cf, shm_name, 32 * ngx_pagesize, &ngx_http_upstream_fair_module);
+    if (ngx_http_upstream_fair_shm_zone == NULL) {
         return NGX_ERROR;
     }
-    peers->shm_zone->init = ngx_http_upstream_fair_init_shm_zone;
+    ngx_http_upstream_fair_shm_zone->init = ngx_http_upstream_fair_init_shm_zone;
+
     peers->shared = NULL;
     peers->current = n - 1;
 
@@ -485,7 +495,7 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
     us->peer.data = usfp;
 
     /* set up shared memory area */
-    shpool = (ngx_slab_pool_t *)usfp->shm_zone->shm.addr;
+    shpool = (ngx_slab_pool_t *)ngx_http_upstream_fair_shm_zone->shm.addr;
 
     if (!usfp->shared) {
         ngx_uint_t i;
