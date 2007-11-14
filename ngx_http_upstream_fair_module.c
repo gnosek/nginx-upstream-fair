@@ -31,9 +31,19 @@ typedef struct {
 
 
 typedef struct {
-    ngx_http_upstream_fair_shared_t    *shared;
+    ngx_rbtree_node_t                   node;
+    ngx_cycle_t                        *cycle;
+    void                               *peers;      /* forms a unique cookie together with cycle */
+    ngx_int_t                           refcount;   /* accessed only under shmtx_lock */
+    ngx_http_upstream_fair_shared_t     stats[1];
+} ngx_http_upstream_fair_shm_block_t;
+
+
+typedef struct {
+    ngx_cycle_t                        *cycle;
+    ngx_http_upstream_fair_shm_block_t *shared;
     ngx_http_upstream_rr_peers_t       *rrp;
-    ngx_uint_t                         current;
+    ngx_uint_t                          current;
 } ngx_http_upstream_fair_peers_t;
 
 
@@ -41,10 +51,10 @@ typedef struct {
 
 
 typedef struct {
-    ngx_http_upstream_rr_peer_data_t   rrpd;
-    ngx_http_upstream_fair_shared_t   *shared;
-    ngx_http_upstream_fair_peers_t    *peer_data;
-    ngx_uint_t                         current;
+    ngx_http_upstream_rr_peer_data_t    rrpd;
+    ngx_http_upstream_fair_shared_t    *shared;
+    ngx_http_upstream_fair_peers_t     *peer_data;
+    ngx_uint_t                          current;
 } ngx_http_upstream_fair_peer_data_t;
 
 
@@ -106,11 +116,124 @@ ngx_module_t  ngx_http_upstream_fair_module = {
 
 
 static ngx_shm_zone_t * ngx_http_upstream_fair_shm_zone;
+static ngx_rbtree_t * ngx_http_upstream_fair_rbtree;
+
+static int
+ngx_http_upstream_fair_compare_rbtree_node(const ngx_rbtree_node_t *v_left,
+    const ngx_rbtree_node_t *v_right)
+{
+    ngx_http_upstream_fair_shm_block_t *left, *right;
+
+    left = (ngx_http_upstream_fair_shm_block_t *) v_left;
+    right = (ngx_http_upstream_fair_shm_block_t *) v_right;
+
+    if (left->cycle < right->cycle) {
+        return -1;
+    } else if (left->cycle > right->cycle) {
+        return 1;
+    } else { /* left->cycle == right->cycle */
+        if (left->peers < right->peers) {
+            return -1;
+        } else if (left->peers > right->peers) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+}
+
+static void
+ngx_rbtree_generic_insert(ngx_rbtree_node_t *temp,
+    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel,
+    int (*compare)(const ngx_rbtree_node_t *left, const ngx_rbtree_node_t *right))
+{
+    for ( ;; ) {
+        if (node->key < temp->key) {
+
+            if (temp->left == sentinel) {
+                temp->left = node;
+                break;
+            }
+
+            temp = temp->left;
+
+        } else if (node->key > temp->key) {
+
+            if (temp->right == sentinel) {
+                temp->right = node;
+                break;
+            }
+
+            temp = temp->right;
+
+        } else { /* node->key == temp->key */
+            if (compare(node, temp) < 0) {
+
+                if (temp->left == sentinel) {
+                    temp->left = node;
+                    break;
+                }
+
+                temp = temp->left;
+
+            } else {
+
+                if (temp->right == sentinel) {
+                    temp->right = node;
+                    break;
+                }
+
+                temp = temp->right;
+            }
+        }
+    }
+
+    node->parent = temp;
+    node->left = sentinel;
+    node->right = sentinel;
+    ngx_rbt_red(node);
+}
+
+
+static void
+ngx_http_upstream_fair_rbtree_insert(ngx_rbtree_node_t *temp,
+    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel) {
+
+    ngx_rbtree_generic_insert(temp, node, sentinel,
+        ngx_http_upstream_fair_compare_rbtree_node);
+}
 
 
 static ngx_int_t
 ngx_http_upstream_fair_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
 {
+    ngx_slab_pool_t                *shpool;
+    ngx_rbtree_t                   *tree;
+    ngx_rbtree_node_t              *sentinel;
+
+    if (data) {
+        shm_zone->data = data;
+        return NGX_OK;
+    }
+
+    shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
+    tree = ngx_slab_alloc(shpool, sizeof *tree);
+    if (tree == NULL) {
+        return NGX_ERROR;
+    }
+
+    sentinel = ngx_slab_alloc(shpool, sizeof *sentinel);
+    if (sentinel == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_rbtree_sentinel_init(sentinel);
+    tree->root = sentinel;
+    tree->sentinel = sentinel;
+    tree->insert = ngx_http_upstream_fair_rbtree_insert;
+    shm_zone->data = tree;
+    ngx_http_upstream_fair_rbtree = tree;
+
     return NGX_OK;
 }
 
@@ -166,6 +289,7 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     }
     ngx_http_upstream_fair_shm_zone->init = ngx_http_upstream_fair_init_shm_zone;
 
+    peers->cycle = cf->cycle;
     peers->shared = NULL;
     peers->current = n - 1;
 
@@ -464,6 +588,114 @@ ngx_http_upstream_free_fair_peer(ngx_peer_connection_t *pc, void *data,
     }
 }
 
+/*
+ * walk through the rbtree, removing old entries and looking for
+ * a matching one -- compared by (cycle, peers) pair
+ *
+ * no attempt at optimisation is made, for two reasons:
+ *  - the tree will be quite small, anyway
+ *  - being called once per worker startup per upstream block,
+ *    this code isn't really the hot path
+ */
+static ngx_http_upstream_fair_shm_block_t *
+ngx_http_upstream_fair_walk_shm(
+    ngx_slab_pool_t *shpool,
+    ngx_rbtree_node_t *node,
+    ngx_rbtree_node_t *sentinel,
+    ngx_cycle_t *cycle, void *peers)
+{
+    ngx_http_upstream_fair_shm_block_t     *uf_node;
+    ngx_http_upstream_fair_shm_block_t     *found_node = NULL;
+    ngx_http_upstream_fair_shm_block_t     *tmp_node;
+
+    if (node == sentinel || !node) {
+        return NULL;
+    }
+
+    /* visit left node */
+    if (node->left != sentinel && node->left) {
+        tmp_node = ngx_http_upstream_fair_walk_shm(shpool, node->left,
+            sentinel, cycle, peers);
+        if (tmp_node) {
+            found_node = tmp_node;
+        }
+    }
+
+    /* visit current node */
+    uf_node = (ngx_http_upstream_fair_shm_block_t *) node;
+    if (uf_node->cycle != cycle) {
+        if (--uf_node->refcount == 0) {
+            ngx_rbtree_delete(ngx_http_upstream_fair_rbtree, node);
+            ngx_slab_free_locked(shpool, node);
+        }
+    } else if (uf_node->peers == peers) {
+        found_node = uf_node;
+    }
+
+    /* visit right node */
+    if (node->right != sentinel && node->right) {
+        tmp_node = ngx_http_upstream_fair_walk_shm(shpool, node->right,
+            sentinel, cycle, peers);
+        if (tmp_node) {
+            found_node = tmp_node;
+        }
+    }
+
+    return found_node;
+}
+
+static ngx_int_t
+ngx_http_upstream_fair_shm_alloc(ngx_http_upstream_fair_peers_t *usfp)
+{
+    ngx_slab_pool_t                        *shpool;
+    ngx_uint_t                              i;
+
+    if (usfp->shared) {
+        return NGX_OK;
+    }
+
+    shpool = (ngx_slab_pool_t *)ngx_http_upstream_fair_shm_zone->shm.addr;
+
+    ngx_shmtx_lock(&shpool->mutex);
+
+    usfp->shared = ngx_http_upstream_fair_walk_shm(shpool,
+        ngx_http_upstream_fair_rbtree->root,
+        ngx_http_upstream_fair_rbtree->sentinel,
+        usfp->cycle, usfp);
+
+    if (usfp->shared) {
+        usfp->shared->refcount++;
+        ngx_shmtx_unlock(&shpool->mutex);
+        return NGX_OK;
+    }
+
+    usfp->shared = ngx_slab_alloc_locked(shpool,
+        sizeof(ngx_http_upstream_fair_shm_block_t) +
+        (usfp->rrp->number - 1) * sizeof(ngx_http_upstream_fair_shared_t));
+
+    if (!usfp->shared) {
+        ngx_shmtx_unlock(&shpool->mutex);
+        return NGX_ERROR;
+    }
+
+    usfp->shared->node.key = ngx_crc32_short((u_char *) &usfp->cycle, sizeof usfp->cycle) ^
+        ngx_crc32_short((u_char *) &usfp, sizeof(usfp));
+
+    usfp->shared->refcount = 1;
+    usfp->shared->cycle = usfp->cycle;
+    usfp->shared->peers = usfp;
+
+    for (i = 0; i < usfp->rrp->number; i++) {
+            usfp->shared->stats[i].nreq = 0;
+            usfp->shared->stats[i].slot = 1;
+            usfp->shared->stats[i].last_active[0] = ngx_current_msec;
+    }
+
+    ngx_rbtree_insert(ngx_http_upstream_fair_rbtree, &usfp->shared->node);
+
+    ngx_shmtx_unlock(&shpool->mutex);
+    return NGX_OK;
+}
 
 ngx_int_t
 ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
@@ -471,7 +703,6 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
 {
     ngx_http_upstream_fair_peer_data_t     *fp;
     ngx_http_upstream_fair_peers_t         *usfp;
-    ngx_slab_pool_t                        *shpool;
 
     fp = r->upstream->peer.data;
 
@@ -495,19 +726,9 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
     us->peer.data = usfp;
 
     /* set up shared memory area */
-    shpool = (ngx_slab_pool_t *)ngx_http_upstream_fair_shm_zone->shm.addr;
+    ngx_http_upstream_fair_shm_alloc(usfp);
 
-    if (!usfp->shared) {
-        ngx_uint_t i;
-        usfp->shared = ngx_slab_alloc(shpool, usfp->rrp->number * sizeof(ngx_http_upstream_fair_shared_t));
-        for (i = 0; i < usfp->rrp->number; i++) {
-                usfp->shared[i].nreq = 0;
-                usfp->shared[i].slot = 1;
-                usfp->shared[i].last_active[0] = ngx_current_msec;
-        }
-    }
-
-    fp->shared = usfp->shared;
+    fp->shared = &usfp->shared->stats[0];
     fp->peer_data = usfp;
     fp->current = usfp->current;
     r->upstream->peer.get = ngx_http_upstream_get_fair_peer;
