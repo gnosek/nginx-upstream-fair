@@ -9,24 +9,9 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
-#define CACHELINE_SIZE 64
-
-/*
- * this must be a power of two as we rely on integer wrap around
- *
- * it should also be small enough to make the whole struct fit in
- * a single cacheline
- */
-#define FS_TIME_SLOTS 4
-
-#define FS_UNPADDED_SIZE (2 * sizeof(ngx_atomic_t) + FS_TIME_SLOTS * sizeof(ngx_msec_t))
-#define FS_STRUCT_SIZE (ngx_align( FS_UNPADDED_SIZE, CACHELINE_SIZE))
-
 typedef struct {
     ngx_atomic_t                        nreq;
-    ngx_atomic_t                        slot;
-    volatile ngx_msec_t                 last_active[FS_TIME_SLOTS];
-    unsigned char                       padding[FS_STRUCT_SIZE - FS_UNPADDED_SIZE];
+    ngx_atomic_t                        last_active;
 } ngx_http_upstream_fair_shared_t;
 
 
@@ -303,14 +288,12 @@ static void
 ngx_http_upstream_fair_update_nreq(ngx_http_upstream_fair_peer_data_t *fp, int delta, ngx_log_t *log)
 {
     ngx_http_upstream_fair_shared_t     *fs;
-    ngx_uint_t                           slot;
 
     fs = &fp->shared[fp->current];
 
     ngx_atomic_fetch_add(&fs->nreq, delta);
-    slot = ngx_atomic_fetch_add(&fs->slot, 1) % FS_TIME_SLOTS;
 
-    fs->last_active[slot] = ngx_current_msec;
+    fs->last_active = ngx_current_msec;
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0, "[upstream_fair] nreq for peer %ui now %d", fp->current, fs->nreq);
 }
@@ -329,11 +312,9 @@ ngx_http_upstream_fair_sched_score(ngx_peer_connection_t *pc,
     ngx_http_upstream_fair_shared_t *fs,
     ngx_http_upstream_rr_peer_t *peer, ngx_uint_t n)
 {
-    ngx_int_t                           slot;
     ngx_msec_t                          last_active_delta;
 
-    slot = (fs->slot - 1) % FS_TIME_SLOTS;
-    last_active_delta = ngx_current_msec - fs->last_active[slot];
+    last_active_delta = ngx_current_msec - fs->last_active;
     if ((ngx_int_t) last_active_delta < 0) {
         ngx_log_error(NGX_LOG_WARN, pc->log, 0, "[upstream_fair] Clock skew of at least %i msec detected", -(ngx_int_t) last_active_delta);
 
@@ -687,8 +668,7 @@ ngx_http_upstream_fair_shm_alloc(ngx_http_upstream_fair_peers_t *usfp)
 
     for (i = 0; i < usfp->rrp->number; i++) {
             usfp->shared->stats[i].nreq = 0;
-            usfp->shared->stats[i].slot = 1;
-            usfp->shared->stats[i].last_active[0] = ngx_current_msec;
+            usfp->shared->stats[i].last_active = ngx_current_msec;
     }
 
     ngx_rbtree_insert(ngx_http_upstream_fair_rbtree, &usfp->shared->node);
