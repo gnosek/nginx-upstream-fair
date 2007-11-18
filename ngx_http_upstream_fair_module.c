@@ -29,6 +29,7 @@ typedef struct {
     ngx_http_upstream_fair_shm_block_t *shared;
     ngx_http_upstream_rr_peers_t       *rrp;
     ngx_uint_t                          current;
+    ngx_uint_t                          size_err:1;
 } ngx_http_upstream_fair_peers_t;
 
 
@@ -54,6 +55,8 @@ static ngx_int_t ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
     ngx_http_upstream_srv_conf_t *us);
 static char *ngx_http_upstream_fair(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_upstream_fair_set_shm_size(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 
 
 static ngx_command_t  ngx_http_upstream_fair_commands[] = {
@@ -61,6 +64,13 @@ static ngx_command_t  ngx_http_upstream_fair_commands[] = {
     { ngx_string("fair"),
       NGX_HTTP_UPS_CONF|NGX_CONF_NOARGS,
       ngx_http_upstream_fair,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("upstream_fair_shm_size"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_fair_set_shm_size,
       0,
       0,
       NULL },
@@ -100,6 +110,7 @@ ngx_module_t  ngx_http_upstream_fair_module = {
 };
 
 
+static ngx_uint_t ngx_http_upstream_fair_shm_size;
 static ngx_shm_zone_t * ngx_http_upstream_fair_shm_zone;
 static ngx_rbtree_t * ngx_http_upstream_fair_rbtree;
 
@@ -222,6 +233,40 @@ ngx_http_upstream_fair_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
     return NGX_OK;
 }
 
+
+static char *
+ngx_http_upstream_fair_set_shm_size(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ssize_t                         new_shm_size;
+    ngx_str_t                      *value;
+
+    value = cf->args->elts;
+
+    new_shm_size = ngx_parse_size(&value[1]);
+    if (new_shm_size == NGX_ERROR) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "Invalid memory area size `%V'", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    new_shm_size = ngx_align(new_shm_size, ngx_pagesize);
+
+    if (new_shm_size < 8 * (ssize_t) ngx_pagesize) {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0, "The upstream_fair_shm_size value must be at least %udKiB", (8 * ngx_pagesize) >> 10);
+        new_shm_size = 8 * ngx_pagesize;
+    }
+
+    if (ngx_http_upstream_fair_shm_size &&
+        ngx_http_upstream_fair_shm_size != (ngx_uint_t) new_shm_size) {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0, "Cannot change memory area size without restart, ignoring change");
+    } else {
+        ngx_http_upstream_fair_shm_size = new_shm_size;
+    }
+    ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "Using %udKiB of shared memory for upstream_fair", new_shm_size >> 10);
+
+    return NGX_CONF_OK;
+}
+
+
 static char *
 ngx_http_upstream_fair(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -266,9 +311,12 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     shm_name->len = sizeof("upstream_fair");
     shm_name->data = (unsigned char *) "upstream_fair";
 
-    /* TODO configurable shm size for large installations */
+    if (ngx_http_upstream_fair_shm_size == 0) {
+        ngx_http_upstream_fair_shm_size = 8 * ngx_pagesize;
+    }
+
     ngx_http_upstream_fair_shm_zone = ngx_shared_memory_add(
-        cf, shm_name, 32 * ngx_pagesize, &ngx_http_upstream_fair_module);
+        cf, shm_name, ngx_http_upstream_fair_shm_size, &ngx_http_upstream_fair_module);
     if (ngx_http_upstream_fair_shm_zone == NULL) {
         return NGX_ERROR;
     }
@@ -277,6 +325,7 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     peers->cycle = cf->cycle;
     peers->shared = NULL;
     peers->current = n - 1;
+    peers->size_err = 0;
 
     us->peer.init = ngx_http_upstream_init_fair_peer;
 
@@ -626,7 +675,7 @@ ngx_http_upstream_fair_walk_shm(
 }
 
 static ngx_int_t
-ngx_http_upstream_fair_shm_alloc(ngx_http_upstream_fair_peers_t *usfp)
+ngx_http_upstream_fair_shm_alloc(ngx_http_upstream_fair_peers_t *usfp, ngx_log_t *log)
 {
     ngx_slab_pool_t                        *shpool;
     ngx_uint_t                              i;
@@ -656,6 +705,12 @@ ngx_http_upstream_fair_shm_alloc(ngx_http_upstream_fair_peers_t *usfp)
 
     if (!usfp->shared) {
         ngx_shmtx_unlock(&shpool->mutex);
+        if (!usfp->size_err) {
+            ngx_log_error(NGX_LOG_EMERG, log, 0,
+                "upstream_fair_shm_size too small (current value is %udKiB)",
+                ngx_http_upstream_fair_shm_size >> 10);
+            usfp->size_err = 1;
+        }
         return NGX_ERROR;
     }
 
@@ -706,7 +761,7 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
     us->peer.data = usfp;
 
     /* set up shared memory area */
-    ngx_http_upstream_fair_shm_alloc(usfp);
+    ngx_http_upstream_fair_shm_alloc(usfp, r->connection->log);
 
     fp->shared = &usfp->shared->stats[0];
     fp->peer_data = usfp;
