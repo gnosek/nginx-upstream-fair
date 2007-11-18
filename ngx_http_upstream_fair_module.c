@@ -524,7 +524,18 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
         if (i) {
             prev_sched_score = sched_score;
         }
+
         sched_score = ngx_http_upstream_fair_sched_score(pc, &fsc, peer, n);
+
+        /*
+         * take peer weight into account
+         */
+        if (sched_score < 0) {
+            sched_score /= peer->current_weight;
+        } else {
+            sched_score *= peer->current_weight;
+        }
+
         ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] pss = %i, ss = %i (n = %d)", prev_sched_score, sched_score, n);
 
         if (sched_score <= prev_sched_score)
