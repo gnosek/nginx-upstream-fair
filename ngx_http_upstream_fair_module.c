@@ -59,6 +59,12 @@ static char *ngx_http_upstream_fair(ngx_conf_t *cf, ngx_command_t *cmd,
 static char *ngx_http_upstream_fair_set_shm_size(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 
+#if (NGX_HTTP_SSL)
+static ngx_int_t ngx_http_upstream_fair_set_session(ngx_peer_connection_t *pc,
+    void *data);
+static void ngx_http_upstream_fair_save_session(ngx_peer_connection_t *pc,
+    void *data);
+#endif
 
 static ngx_command_t  ngx_http_upstream_fair_commands[] = {
 
@@ -809,13 +815,6 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
-    r->upstream->peer.get = ngx_http_upstream_get_fair_peer;
-    r->upstream->peer.free = ngx_http_upstream_free_fair_peer;
-    r->upstream->peer.tries = usfp->rrp->number;
-#if (NGX_HTTP_SSL)
-    /* TODO set up SSL callbacks */
-#endif
-
     /* set up shared memory area */
     ngx_http_upstream_fair_shm_alloc(usfp, r->connection->log);
 
@@ -823,8 +822,85 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
     fp->rrp = usfp->rrp;
     fp->current = usfp->current;
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "[upstream_fair] peer->tries = %d", r->upstream->peer.tries);
+    r->upstream->peer.get = ngx_http_upstream_get_fair_peer;
+    r->upstream->peer.free = ngx_http_upstream_free_fair_peer;
+    r->upstream->peer.tries = usfp->rrp->number;
+#if (NGX_HTTP_SSL)
+    r->upstream->peer.set_session =
+                               ngx_http_upstream_fair_set_session;
+    r->upstream->peer.save_session =
+                               ngx_http_upstream_fair_save_session;
+    /* TODO set up SSL callbacks */
+#endif
 
     return NGX_OK;
 }
 
+#if (NGX_HTTP_SSL)
+static ngx_int_t
+ngx_http_upstream_fair_set_session(ngx_peer_connection_t *pc, void *data)
+{
+    ngx_http_upstream_fair_peer_data_t  *fp = data;
+
+    ngx_int_t                     rc;
+    ngx_ssl_session_t            *ssl_session;
+    ngx_http_upstream_rr_peer_t  *peer;
+
+    peer = &fp->rrp->peer[fp->current];
+
+    /* TODO: threads only mutex */
+    /* ngx_lock_mutex(fp->rrp->peers->mutex); */
+
+    ssl_session = peer->ssl_session;
+
+    rc = ngx_ssl_set_session(pc->connection, ssl_session);
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                   "set session: %p:%d",
+                   ssl_session, ssl_session ? ssl_session->references : 0);
+
+    /* ngx_unlock_mutex(fp->rrp->peers->mutex); */
+
+    return rc;
+}
+
+static void
+ngx_http_upstream_fair_save_session(ngx_peer_connection_t *pc, void *data)
+{
+    ngx_http_upstream_fair_peer_data_t  *fp = data;
+
+    ngx_ssl_session_t            *old_ssl_session, *ssl_session;
+    ngx_http_upstream_rr_peer_t  *peer;
+
+    ssl_session = ngx_ssl_get_session(pc->connection);
+
+    if (ssl_session == NULL) {
+        return;
+    }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                   "save session: %p:%d", ssl_session, ssl_session->references);
+
+    peer = &fp->rrp->peer[fp->current];
+
+    /* TODO: threads only mutex */
+    /* ngx_lock_mutex(fp->rrp->peers->mutex); */
+
+    old_ssl_session = peer->ssl_session;
+    peer->ssl_session = ssl_session;
+
+    /* ngx_unlock_mutex(fp->rrp->peers->mutex); */
+
+    if (old_ssl_session) {
+
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                       "old session: %p:%d",
+                       old_ssl_session, old_ssl_session->references);
+
+        /* TODO: may block */
+
+        ngx_ssl_free_session(old_ssl_session);
+    }
+}
+
+#endif
