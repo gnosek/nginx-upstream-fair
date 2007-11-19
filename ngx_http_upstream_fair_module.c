@@ -846,6 +846,9 @@ ngx_http_upstream_fair_set_session(ngx_peer_connection_t *pc, void *data)
     ngx_ssl_session_t            *ssl_session;
     ngx_http_upstream_rr_peer_t  *peer;
 
+    if (fp->current == NGX_PEER_INVALID)
+        return NGX_OK;
+
     peer = &fp->rrp->peer[fp->current];
 
     /* TODO: threads only mutex */
@@ -871,6 +874,9 @@ ngx_http_upstream_fair_save_session(ngx_peer_connection_t *pc, void *data)
 
     ngx_ssl_session_t            *old_ssl_session, *ssl_session;
     ngx_http_upstream_rr_peer_t  *peer;
+
+    if (fp->current == NGX_PEER_INVALID)
+        return;
 
     ssl_session = ngx_ssl_get_session(pc->connection);
 
