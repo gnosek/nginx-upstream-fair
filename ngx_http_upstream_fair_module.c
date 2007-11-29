@@ -577,10 +577,12 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
         /*
          * take peer weight into account
          */
-        if (sched_score < 0) {
-            sched_score /= peer->current_weight;
-        } else {
-            sched_score *= peer->current_weight;
+        if (peer->current_weight > 0) {
+            if (sched_score < 0) {
+                sched_score /= peer->current_weight;
+            } else {
+                sched_score *= peer->current_weight;
+            }
         }
 
         ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] pss = %i, ss = %i (n = %d)", prev_sched_score, sched_score, n);
