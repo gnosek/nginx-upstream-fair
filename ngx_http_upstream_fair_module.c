@@ -697,13 +697,22 @@ ngx_http_upstream_fair_walk_shm(
     ngx_http_upstream_fair_shm_block_t     *found_node = NULL;
     ngx_http_upstream_fair_shm_block_t     *tmp_node;
 
-    if (node == sentinel || !node) {
+    if (node == sentinel) {
         return NULL;
     }
 
     /* visit left node */
-    if (node->left != sentinel && node->left) {
+    if (node->left != sentinel) {
         tmp_node = ngx_http_upstream_fair_walk_shm(shpool, node->left,
+            sentinel, cycle, peers);
+        if (tmp_node) {
+            found_node = tmp_node;
+        }
+    }
+
+    /* visit right node */
+    if (node->right != sentinel) {
+        tmp_node = ngx_http_upstream_fair_walk_shm(shpool, node->right,
             sentinel, cycle, peers);
         if (tmp_node) {
             found_node = tmp_node;
@@ -719,15 +728,6 @@ ngx_http_upstream_fair_walk_shm(
         }
     } else if (uf_node->peers == peers) {
         found_node = uf_node;
-    }
-
-    /* visit right node */
-    if (node->right != sentinel && node->right) {
-        tmp_node = ngx_http_upstream_fair_walk_shm(shpool, node->right,
-            sentinel, cycle, peers);
-        if (tmp_node) {
-            found_node = tmp_node;
-        }
     }
 
     return found_node;
@@ -832,7 +832,6 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
                                ngx_http_upstream_fair_set_session;
     r->upstream->peer.save_session =
                                ngx_http_upstream_fair_save_session;
-    /* TODO set up SSL callbacks */
 #endif
 
     return NGX_OK;
