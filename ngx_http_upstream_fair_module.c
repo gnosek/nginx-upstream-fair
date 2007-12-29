@@ -397,16 +397,31 @@ ngx_http_upstream_fair_update_nreq(ngx_http_upstream_fair_peer_data_t *fp, int d
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0, "[upstream_fair] nreq for peer %ui now %d", fp->current, fs->nreq);
 }
 
-
 /*
- * should probably be comparable to average request processing
- * time, including the occasional hogs
+ * SCHED_TIME_BITS is the portion of an ngx_uint_t which represents the
+ * last_time_delta part (time since last activity in msec). The rest
+ * (top bits) represents the number of currently processed requests.
  *
- * it's probably better to keep this estimate pessimistic
+ * The value is not too critical because overflow is handled via
+ * saturation. With the default value of 24, scheduling is exact for
+ * requests shorter than 16777 sec and for less than 256 requests per
+ * backend (on 32-bit architectures). Beyond these limits, the algorithm
+ * essentially falls back to pure weighted round-robin
+ *
+ * A higher score means less suitable -- this changed from previous
+ * releases.
+ *
+ * The `delta' parameter is bit-negated so that high values yield low
+ * scores and get chosen more often.
  */
-#define FS_TIME_SCALE_OFFSET 1000
 
-static ngx_int_t
+#define SCHED_TIME_BITS 24
+#define SCHED_NREQ_MAX ((~0UL) >> SCHED_TIME_BITS)
+#define SCHED_TIME_MAX ((1 << SCHED_TIME_BITS) - 1)
+#define SCHED_SCORE(nreq,delta) (((nreq) << SCHED_TIME_BITS) | (~(delta)))
+#define MIN(a,b) (((a) < (b)) ? (a) : (b))
+
+static ngx_uint_t
 ngx_http_upstream_fair_sched_score(ngx_peer_connection_t *pc,
     ngx_http_upstream_fair_shared_t *fs,
     ngx_http_upstream_rr_peer_t *peer, ngx_uint_t n)
@@ -418,34 +433,20 @@ ngx_http_upstream_fair_sched_score(ngx_peer_connection_t *pc,
         ngx_log_error(NGX_LOG_WARN, pc->log, 0, "[upstream_fair] Clock skew of at least %i msec detected", -(ngx_int_t) last_active_delta);
 
         /* a pretty arbitrary value */
-        last_active_delta = FS_TIME_SCALE_OFFSET;
+        last_active_delta = abs(last_active_delta);
     }
 
     /* sanity check */
-    if (fs->nreq > INT_MAX) {
+    if ((ngx_int_t)fs->nreq < 0) {
         ngx_log_error(NGX_LOG_WARN, pc->log, 0, "[upstream_fair] upstream %ui has negative nreq (%i)", n, fs->nreq);
-        return -FS_TIME_SCALE_OFFSET;
+        return SCHED_SCORE(0, last_active_delta);
     }
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] nreq = %i, last_active_delta = %ui", fs->nreq, last_active_delta);
 
-    /*
-     * should be pretty unlikely to process a request for many days and still not time out,
-     * or to become swamped with requests this heavily; still, we shouldn't drop this backend
-     * completely as it wouldn't ever get a chance to recover
-     */
-    if (fs->nreq > 1 && last_active_delta > 0 && (INT_MAX / ( last_active_delta + FS_TIME_SCALE_OFFSET )) < (fs->nreq - 1)) {
-        ngx_log_error(NGX_LOG_WARN, pc->log, 0, "[upstream_fair] upstream %ui has been active for %ul seconds",
-            n, last_active_delta / 1000);
-
-        /*
-         * schedule behind "sane" backends with the same number of requests pending
-         * but (hopefully) before backends with more requests
-         */
-        return -fs->nreq * FS_TIME_SCALE_OFFSET;
-    } else {
-        return (1 - fs->nreq) * FS_TIME_SCALE_OFFSET + last_active_delta;
-    }
+    return SCHED_SCORE(
+        MIN(fs->nreq, SCHED_NREQ_MAX),
+        MIN(last_active_delta, SCHED_TIME_MAX));
 }
 
 /*
@@ -491,7 +492,7 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
     ngx_uint_t                          npeers, total_npeers;
     ngx_http_upstream_fair_shared_t     fsc;
     time_t                              now;
-    ngx_int_t                           prev_sched_score, sched_score = 0;
+    ngx_uint_t                          prev_sched_score, sched_score = 0;
 
     total_npeers = npeers = fp->rrp->number;
 
@@ -578,16 +579,12 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
          * take peer weight into account
          */
         if (peer->current_weight > 0) {
-            if (sched_score < 0) {
-                sched_score /= peer->current_weight;
-            } else {
-                sched_score *= peer->current_weight;
-            }
+            sched_score /= peer->current_weight;
         }
 
         ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] pss = %i, ss = %i (n = %d)", prev_sched_score, sched_score, n);
 
-        if (sched_score <= prev_sched_score)
+        if (sched_score >= prev_sched_score)
             return NGX_OK;
 
         *peer_id = n;
