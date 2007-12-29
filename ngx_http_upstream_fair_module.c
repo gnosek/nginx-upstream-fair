@@ -489,12 +489,12 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
     ngx_http_upstream_fair_peer_data_t *fp, ngx_uint_t *peer_id)
 {
     ngx_uint_t                          i, n;
-    ngx_uint_t                          npeers, total_npeers;
+    ngx_uint_t                          npeers;
     ngx_http_upstream_fair_shared_t     fsc;
     time_t                              now;
-    ngx_uint_t                          prev_sched_score, sched_score = 0;
+    ngx_uint_t                          best_sched_score = UINT_MAX, sched_score;
 
-    total_npeers = npeers = fp->rrp->number;
+    npeers = fp->rrp->number;
 
     /* just a single backend */
     if (npeers == 1) {
@@ -505,7 +505,7 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
     now = ngx_time();
 
     /* any idle backends? */
-    for (i = 0, n = fp->current; i < npeers; i++, n = (n + 1) % total_npeers) {
+    for (i = 0, n = fp->current; i < npeers; i++, n = (n + 1) % npeers) {
         if (ngx_atomic_fetch_add(&fp->shared[n].nreq, 0) == 0 &&
             ngx_http_upstream_fair_try_peer(pc, fp, n, now) == NGX_OK) {
 
@@ -515,39 +515,10 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
         }
     }
 
-    /* no idle backends, choose the least loaded one */
-
-    /* skip the nearest failed backends */
-    n = fp->current;
-    while (npeers && pc->tries) {
-        if (ngx_http_upstream_fair_try_peer(pc, fp, n, now) == NGX_OK) {
-            break;
-        }
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] backend %d is down, npeers = %d", n, npeers - 1);
-        n = (n + 1) % total_npeers;
-        npeers--;
-    }
-
-    /* all backends down or failed? */
-    if (!npeers || !pc->tries) {
-        return NGX_BUSY;
-    }
-
-    /* calc our current sched score */
-    fsc = fp->shared[n];
-    prev_sched_score = ngx_http_upstream_fair_sched_score(pc,
-        &fsc, &fp->rrp->peer[n], n);
-
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] pss = %i (n = %d)", prev_sched_score, n);
-
-    *peer_id = n;
-
-    n = (n + 1) % total_npeers;
-
-    /* calc sched scores for all the peers, until it no longer
-     * increases, or we wrap around to the beginning
+    /*
+     * calculate sched scores for all the peers, choosing the lowest one
      */
-    for (i = 0; i < npeers; i++, n = (n + 1) % total_npeers) {
+    for (i = 0; i < npeers; i++, n = (n + 1) % npeers) {
         ngx_http_upstream_rr_peer_t *peer;
 
         if (ngx_http_upstream_fair_try_peer(pc, fp, n, now) != NGX_OK) {
@@ -569,10 +540,6 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
         }
 
         fsc = fp->shared[n];
-        if (i) {
-            prev_sched_score = sched_score;
-        }
-
         sched_score = ngx_http_upstream_fair_sched_score(pc, &fsc, peer, n);
 
         /*
@@ -582,12 +549,12 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
             sched_score /= peer->current_weight;
         }
 
-        ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] pss = %i, ss = %i (n = %d)", prev_sched_score, sched_score, n);
+        ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] bss = %i, ss = %i (n = %d)", best_sched_score, sched_score, n);
 
-        if (sched_score >= prev_sched_score)
-            return NGX_OK;
-
-        *peer_id = n;
+        if (sched_score <= best_sched_score) {
+            *peer_id = n;
+            best_sched_score = sched_score;
+        }
     }
 
     return NGX_OK;
