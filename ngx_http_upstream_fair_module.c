@@ -419,7 +419,7 @@ ngx_http_upstream_fair_update_nreq(ngx_http_upstream_fair_peer_data_t *fp, int d
 #define SCHED_NREQ_MAX ((~0UL) >> SCHED_TIME_BITS)
 #define SCHED_TIME_MAX ((1 << SCHED_TIME_BITS) - 1)
 #define SCHED_SCORE(nreq,delta) (((nreq) << SCHED_TIME_BITS) | (~(delta)))
-#define MIN(a,b) (((a) < (b)) ? (a) : (b))
+#define ngx_upstream_fair_min(a,b) (((a) < (b)) ? (a) : (b))
 
 static ngx_uint_t
 ngx_http_upstream_fair_sched_score(ngx_peer_connection_t *pc,
@@ -445,8 +445,8 @@ ngx_http_upstream_fair_sched_score(ngx_peer_connection_t *pc,
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] nreq = %i, last_active_delta = %ui", fs->nreq, last_active_delta);
 
     return SCHED_SCORE(
-        MIN(fs->nreq, SCHED_NREQ_MAX),
-        MIN(last_active_delta, SCHED_TIME_MAX));
+        ngx_upstream_fair_min(fs->nreq, SCHED_NREQ_MAX),
+        ngx_upstream_fair_min(last_active_delta, SCHED_TIME_MAX));
 }
 
 /*
