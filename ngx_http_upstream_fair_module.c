@@ -39,6 +39,7 @@ typedef struct {
 typedef struct {
     ngx_http_upstream_fair_shared_t    *shared;
     ngx_http_upstream_rr_peers_t       *rrp;
+    ngx_http_upstream_fair_peers_t     *peers;
     ngx_uint_t                          current;
     uintptr_t                          *tried;
     uintptr_t                           data;
@@ -591,6 +592,7 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
     /* assert(ret == NGX_OK); */
     peer = &fp->rrp->peer[peer_id];
     fp->current = peer_id;
+    fp->peers->current = peer_id;
     pc->sockaddr = peer->sockaddr;
     pc->socklen = peer->socklen;
     pc->name = &peer->name;
@@ -787,6 +789,7 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
     fp->shared = &usfp->shared->stats[0];
     fp->rrp = usfp->rrp;
     fp->current = usfp->current;
+    fp->peers = usfp;
 
     r->upstream->peer.get = ngx_http_upstream_get_fair_peer;
     r->upstream->peer.free = ngx_http_upstream_free_fair_peer;
