@@ -508,6 +508,7 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
     /* any idle backends? */
     for (i = 0, n = fp->current; i < npeers; i++, n = (n + 1) % npeers) {
         if (ngx_atomic_fetch_add(&fp->shared[n].nreq, 0) == 0 &&
+            fp->rrp->peer[n].fails == 0 &&
             ngx_http_upstream_fair_try_peer(pc, fp, n, now) == NGX_OK) {
 
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] peer %i is idle", n);
