@@ -479,9 +479,6 @@ ngx_http_upstream_fair_try_peer(ngx_peer_connection_t *pc,
     }
 
     ngx_bitvector_set(fp->tried, peer_id);
-
-    if (pc)
-        pc->tries--;
     return NGX_BUSY;
 }
 
@@ -577,6 +574,9 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] fp->current = %d, peer_id = %d, ret = %d",
         fp->current, peer_id, ret);
 
+    if (pc)
+        pc->tries--;
+
     if (ret == NGX_BUSY) {
         for (i = 0; i < fp->rrp->number; i++) {
             fp->rrp->peer[i].fails = 0;
@@ -584,9 +584,6 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
 
         pc->name = fp->rrp->name;
         fp->current = NGX_PEER_INVALID;
-        if (pc->tries > 0) {
-            pc->tries--;
-        }
         return NGX_BUSY;
     }
 
