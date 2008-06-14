@@ -15,22 +15,24 @@ typedef struct {
 } ngx_http_upstream_fair_shared_t;
 
 
+typedef struct ngx_http_upstream_fair_peers_s ngx_http_upstream_fair_peers_t;
+
 typedef struct {
     ngx_rbtree_node_t                   node;
     ngx_cycle_t                        *cycle;
-    void                               *peers;      /* forms a unique cookie together with cycle */
+    ngx_http_upstream_fair_peers_t     *peers;      /* forms a unique cookie together with cycle */
     ngx_int_t                           refcount;   /* accessed only under shmtx_lock */
     ngx_http_upstream_fair_shared_t     stats[1];
 } ngx_http_upstream_fair_shm_block_t;
 
 
-typedef struct {
+struct ngx_http_upstream_fair_peers_s {
     ngx_cycle_t                        *cycle;
     ngx_http_upstream_fair_shm_block_t *shared;
     ngx_http_upstream_rr_peers_t       *rrp;
     ngx_uint_t                          current;
     ngx_uint_t                          size_err:1;
-} ngx_http_upstream_fair_peers_t;
+};
 
 
 #define NGX_PEER_INVALID (~0UL)
