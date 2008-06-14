@@ -475,12 +475,13 @@ ngx_http_upstream_fair_try_peer(ngx_peer_connection_t *pc,
         }
 
         if (now - peer->accessed > peer->fail_timeout) {
+            ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] resetting fail count for peer %d, time delta %d > %d",
+                peer_id, now - peer->accessed, peer->fail_timeout);
             peer->fails = 0;
             return NGX_OK;
         }
     }
 
-    ngx_bitvector_set(fp->tried, peer_id);
     return NGX_BUSY;
 }
 
@@ -493,6 +494,7 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
     ngx_http_upstream_fair_shared_t     fsc;
     time_t                              now;
     ngx_uint_t                          best_sched_score = UINT_MAX, sched_score;
+    ngx_http_upstream_rr_peer_t        *peer;
 
     npeers = fp->rrp->number;
 
@@ -520,7 +522,7 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
      * calculate sched scores for all the peers, choosing the lowest one
      */
     for (i = 0; i < npeers; i++, n = (n + 1) % npeers) {
-        ngx_http_upstream_rr_peer_t *peer;
+        ngx_uint_t weight;
 
         if (ngx_http_upstream_fair_try_peer(pc, fp, n, now) != NGX_OK) {
             if (!pc->tries) {
@@ -528,34 +530,40 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
                 return NGX_BUSY;
             }
 
-            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] backend %d is dead", n);
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] backend %d already tried", n);
             continue;
         }
 
         peer = &fp->rrp->peer[n];
-
-        if (peer->current_weight-- == 0) {
-            peer->current_weight = peer->weight;
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] peer %d expired weight, reset to %d", n, peer->weight);
-            continue;
-        }
-
         fsc = fp->shared[n];
         sched_score = ngx_http_upstream_fair_sched_score(pc, &fsc, peer, n);
 
         /*
          * take peer weight into account
          */
-        if (peer->current_weight > 0) {
-            sched_score /= peer->current_weight;
+        weight = peer->current_weight;
+        if (peer->max_fails) {
+            ngx_uint_t mf = peer->max_fails;
+            weight = peer->current_weight * (mf - peer->fails) / mf;
+        }
+        if (weight > 0) {
+            sched_score /= weight;
         }
 
-        ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] bss = %i, ss = %i (n = %d)", best_sched_score, sched_score, n);
+        ngx_log_debug7(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] bss = %i, ss = %i (n = %d, w = %d/%d, f = %d/%d, weight = %d)",
+            best_sched_score, sched_score, n, peer->current_weight, peer->weight, peer->fails, peer->max_fails, weight);
 
         if (sched_score <= best_sched_score) {
             *peer_id = n;
             best_sched_score = sched_score;
         }
+    }
+
+    peer = &fp->rrp->peer[*peer_id];
+    ngx_bitvector_set(fp->tried, *peer_id);
+    if (peer->current_weight-- == 0) {
+        peer->current_weight = peer->weight;
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] peer %d expired weight, reset to %d", n, peer->weight);
     }
 
     return NGX_OK;
@@ -608,7 +616,6 @@ ngx_http_upstream_free_fair_peer(ngx_peer_connection_t *pc, void *data,
 {
     ngx_http_upstream_fair_peer_data_t     *fp = data;
     ngx_http_upstream_rr_peer_t            *peer;
-    ngx_uint_t                              weight_delta;
 
     ngx_log_debug4(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] fp->current = %d, state = %ui, pc->tries = %d, pc->data = %p",
         fp->current, state, pc->tries, pc->data);
@@ -632,14 +639,6 @@ ngx_http_upstream_free_fair_peer(ngx_peer_connection_t *pc, void *data,
 
         peer->fails++;
         peer->accessed = ngx_time();
-
-        weight_delta = peer->weight / peer->max_fails;
-
-        if ((ngx_uint_t) peer->current_weight < weight_delta) {
-            peer->current_weight = 0;
-        } else {
-            peer->current_weight -= weight_delta;
-        }
     }
 }
 
