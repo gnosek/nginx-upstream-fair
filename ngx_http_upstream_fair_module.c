@@ -879,3 +879,4 @@ ngx_http_upstream_fair_save_session(ngx_peer_connection_t *pc, void *data)
 }
 
 #endif
+/* vim: set et ts=4 sw=4: */
