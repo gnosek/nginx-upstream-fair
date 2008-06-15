@@ -44,7 +44,9 @@ typedef struct {
     ngx_http_upstream_fair_peers_t     *peers;
     ngx_uint_t                          current;
     uintptr_t                          *tried;
+    uintptr_t                          *done;
     uintptr_t                           data;
+    uintptr_t                           data2;
 } ngx_http_upstream_fair_peer_data_t;
 
 
@@ -550,7 +552,7 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
             sched_score /= weight;
         }
 
-        ngx_log_debug7(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] bss = %i, ss = %i (n = %d, w = %d/%d, f = %d/%d, weight = %d)",
+        ngx_log_debug7(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] bss = %ui, ss = %ui (n = %d, w = %d/%d, f = %d/%d, weight = %d)",
             best_sched_score, sched_score, n, peer->current_weight, peer->weight, peer->fails, peer->max_fails, weight);
 
         if (sched_score <= best_sched_score) {
@@ -624,10 +626,9 @@ ngx_http_upstream_free_fair_peer(ngx_peer_connection_t *pc, void *data,
         return;
     }
 
-    ngx_http_upstream_fair_update_nreq(data, -1, pc->log);
-
-    if (state == 0 && pc->tries == 0) {
-        return;
+    if (!ngx_bitvector_test(fp->done, fp->current)) {
+        ngx_bitvector_set(fp->done, fp->current);
+        ngx_http_upstream_fair_update_nreq(data, -1, pc->log);
     }
 
     if (fp->rrp->number == 1) {
@@ -656,7 +657,7 @@ ngx_http_upstream_fair_walk_shm(
     ngx_slab_pool_t *shpool,
     ngx_rbtree_node_t *node,
     ngx_rbtree_node_t *sentinel,
-    ngx_cycle_t *cycle, void *peers)
+    ngx_cycle_t *cycle, ngx_http_upstream_fair_peers_t *peers)
 {
     ngx_http_upstream_fair_shm_block_t     *uf_node;
     ngx_http_upstream_fair_shm_block_t     *found_node = NULL;
@@ -777,6 +778,7 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
     usfp = us->peer.data;
 
     fp->tried = ngx_bitvector_alloc(r->pool, usfp->rrp->number, &fp->data);
+    fp->done = ngx_bitvector_alloc(r->pool, usfp->rrp->number, &fp->data2);
 
     if (fp->tried == NULL) {
         return NGX_ERROR;
