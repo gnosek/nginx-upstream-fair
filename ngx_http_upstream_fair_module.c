@@ -12,6 +12,8 @@
 typedef struct {
     ngx_atomic_t                        nreq;
     ngx_atomic_t                        last_active;
+    ngx_atomic_t                        fails;
+    ngx_atomic_t                        current_weight;
 } ngx_http_upstream_fair_shared_t;
 
 
@@ -26,6 +28,7 @@ typedef struct {
 } ngx_http_upstream_fair_shm_block_t;
 
 typedef struct {
+    ngx_http_upstream_fair_shared_t    *shared;
     struct sockaddr                    *sockaddr;
     socklen_t                           socklen;
     ngx_str_t                           name;
@@ -34,11 +37,7 @@ typedef struct {
     ngx_uint_t                          max_fails;
     time_t                              fail_timeout;
 
-    /* TODO: move these to shared memory */
-    ngx_uint_t                          fails;
-    ngx_uint_t                          current_weight;
-    time_t                              accessed;   /* TODO: get rid of it */
-
+    time_t                              accessed;
     ngx_uint_t                          down:1;
 
 #if (NGX_HTTP_SSL)
@@ -64,7 +63,6 @@ struct ngx_http_upstream_fair_peers_s {
 
 
 typedef struct {
-    ngx_http_upstream_fair_shared_t    *shared;
     ngx_http_upstream_fair_peers_t     *peers;
     ngx_uint_t                          current;
     uintptr_t                          *tried;
@@ -423,7 +421,6 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
                 peers->peer[n].fail_timeout = server[i].fail_timeout;
                 peers->peer[n].down = server[i].down;
                 peers->peer[n].weight = server[i].down ? 0 : server[i].weight;
-                peers->peer[n].current_weight = peers->peer[n].weight;
                 n++;
             }
         }
@@ -471,7 +468,6 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
                 backup->peer[n].socklen = server[i].addrs[j].socklen;
                 backup->peer[n].name = server[i].addrs[j].name;
                 backup->peer[n].weight = server[i].weight;
-                backup->peer[n].current_weight = server[i].weight;
                 backup->peer[n].max_fails = server[i].max_fails;
                 backup->peer[n].fail_timeout = server[i].fail_timeout;
                 backup->peer[n].down = server[i].down;
@@ -529,7 +525,6 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
         peers->peer[i].socklen = u.addrs[i].socklen;
         peers->peer[i].name = u.addrs[i].name;
         peers->peer[i].weight = 1;
-        peers->peer[i].current_weight = 1;
         peers->peer[i].max_fails = 1;
         peers->peer[i].fail_timeout = 10;
     }
@@ -592,7 +587,7 @@ ngx_http_upstream_fair_update_nreq(ngx_http_upstream_fair_peer_data_t *fp, int d
 {
     ngx_http_upstream_fair_shared_t     *fs;
 
-    fs = &fp->shared[fp->current];
+    fs = fp->peers->peer[fp->current].shared;
 
     ngx_atomic_fetch_add(&fs->nreq, delta);
 
@@ -671,14 +666,14 @@ ngx_http_upstream_fair_try_peer(ngx_peer_connection_t *pc,
     peer = &fp->peers->peer[peer_id];
 
     if (!peer->down) {
-        if (peer->max_fails == 0 || peer->fails < peer->max_fails) {
+        if (peer->max_fails == 0 || peer->shared->fails < peer->max_fails) {
             return NGX_OK;
         }
 
         if (now - peer->accessed > peer->fail_timeout) {
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] resetting fail count for peer %d, time delta %d > %d",
                 peer_id, now - peer->accessed, peer->fail_timeout);
-            peer->fails = 0;
+            peer->shared->fails = 0;
             return NGX_OK;
         }
     }
@@ -709,8 +704,8 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
 
     /* any idle backends? */
     for (i = 0, n = fp->current; i < npeers; i++, n = (n + 1) % npeers) {
-        if (ngx_atomic_fetch_add(&fp->shared[n].nreq, 0) == 0 &&
-            fp->peers->peer[n].fails == 0 &&
+        if (ngx_atomic_fetch_add(&fp->peers->peer[n].shared->nreq, 0) == 0 &&
+            fp->peers->peer[n].shared->fails == 0 &&
             ngx_http_upstream_fair_try_peer(pc, fp, n, now) == NGX_OK) {
 
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] peer %i is idle", n);
@@ -736,23 +731,23 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
         }
 
         peer = &fp->peers->peer[n];
-        fsc = fp->shared[n];
+        fsc = *peer->shared;
         sched_score = ngx_http_upstream_fair_sched_score(pc, &fsc, peer, n);
 
         /*
          * take peer weight into account
          */
-        weight = peer->current_weight;
+        weight = peer->shared->current_weight;
         if (peer->max_fails) {
             ngx_uint_t mf = peer->max_fails;
-            weight = peer->current_weight * (mf - peer->fails) / mf;
+            weight = peer->shared->current_weight * (mf - peer->shared->fails) / mf;
         }
         if (weight > 0) {
             sched_score /= weight;
         }
 
         ngx_log_debug7(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] bss = %ui, ss = %ui (n = %d, w = %d/%d, f = %d/%d, weight = %d)",
-            best_sched_score, sched_score, n, peer->current_weight, peer->weight, peer->fails, peer->max_fails, weight);
+            best_sched_score, sched_score, n, peer->shared->current_weight, peer->weight, peer->shared->fails, peer->max_fails, weight);
 
         if (sched_score <= best_sched_score) {
             *peer_id = n;
@@ -762,8 +757,8 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
 
     peer = &fp->peers->peer[*peer_id];
     ngx_bitvector_set(fp->tried, *peer_id);
-    if (peer->current_weight-- == 0) {
-        peer->current_weight = peer->weight;
+    if (peer->shared->current_weight-- == 0) {
+        peer->shared->current_weight = peer->weight;
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] peer %d expired weight, reset to %d", n, peer->weight);
     }
 
@@ -790,7 +785,7 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
 
     if (ret == NGX_BUSY) {
         for (i = 0; i < fp->peers->number; i++) {
-            fp->peers->peer[i].fails = 0;
+            fp->peers->peer[i].shared->fails = 0;
         }
 
         pc->name = fp->peers->name;
@@ -837,7 +832,7 @@ ngx_http_upstream_free_fair_peer(ngx_peer_connection_t *pc, void *data,
     if (state & NGX_PEER_FAILED) {
         peer = &fp->peers->peer[fp->current];
 
-        peer->fails++;
+        peer->shared->fails++;
         peer->accessed = ngx_time();
     }
 }
@@ -962,6 +957,7 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
 {
     ngx_http_upstream_fair_peer_data_t     *fp;
     ngx_http_upstream_fair_peers_t         *usfp;
+    ngx_uint_t                              n;
 
     fp = r->upstream->peer.data;
 
@@ -979,16 +975,19 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
     fp->tried = ngx_bitvector_alloc(r->pool, usfp->number, &fp->data);
     fp->done = ngx_bitvector_alloc(r->pool, usfp->number, &fp->data2);
 
-    if (fp->tried == NULL) {
+    if (fp->tried == NULL || fp->done == NULL) {
         return NGX_ERROR;
     }
 
     /* set up shared memory area */
     ngx_http_upstream_fair_shm_alloc(usfp, r->connection->log);
 
-    fp->shared = &usfp->shared->stats[0];
     fp->current = usfp->current;
     fp->peers = usfp;
+
+    for (n = 0; n < usfp->number; n++) {
+        usfp->peer[n].shared = &usfp->shared->stats[n];
+    }
 
     r->upstream->peer.get = ngx_http_upstream_get_fair_peer;
     r->upstream->peer.free = ngx_http_upstream_free_fair_peer;
