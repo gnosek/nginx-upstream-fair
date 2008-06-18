@@ -47,29 +47,16 @@ typedef struct {
 
 } ngx_http_upstream_fair_peer_t;
 
-typedef struct ngx_http_upstream_fair_rr_peers_s ngx_http_upstream_fair_rr_peers_t;
-
-struct ngx_http_upstream_fair_rr_peers_s {
-    ngx_uint_t                      single;        /* unsigned  single:1; */
-    ngx_uint_t                      number;
-    ngx_uint_t                      last_cached;
-
- /* ngx_mutex_t                    *mutex; */
-    ngx_connection_t              **cached;
-
-    ngx_str_t                      *name;
-
-    ngx_http_upstream_fair_rr_peers_t   *next;
-
-    ngx_http_upstream_fair_peer_t     peer[1];
-};
-
 struct ngx_http_upstream_fair_peers_s {
     ngx_cycle_t                        *cycle;
     ngx_http_upstream_fair_shm_block_t *shared;
-    ngx_http_upstream_fair_rr_peers_t  *rrp;
     ngx_uint_t                          current;
     ngx_uint_t                          size_err:1;
+
+    ngx_uint_t                          number;
+    ngx_str_t                          *name;
+    ngx_http_upstream_fair_peers_t     *next;           /* for backup peers support, not really used yet */
+    ngx_http_upstream_fair_peer_t       peer[1];
 };
 
 
@@ -78,7 +65,6 @@ struct ngx_http_upstream_fair_peers_s {
 
 typedef struct {
     ngx_http_upstream_fair_shared_t    *shared;
-    ngx_http_upstream_fair_rr_peers_t  *rrp;
     ngx_http_upstream_fair_peers_t     *peers;
     ngx_uint_t                          current;
     uintptr_t                          *tried;
@@ -398,7 +384,7 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     ngx_url_t                      u;
     ngx_uint_t                     i, j, n;
     ngx_http_upstream_server_t    *server;
-    ngx_http_upstream_fair_rr_peers_t  *peers, *backup;
+    ngx_http_upstream_fair_peers_t  *peers, *backup;
 
     if (us->servers) {
         server = us->servers->elts;
@@ -413,13 +399,12 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
             n += server[i].naddrs;
         }
 
-        peers = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_fair_rr_peers_t)
+        peers = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_fair_peers_t)
                               + sizeof(ngx_http_upstream_fair_peer_t) * (n - 1));
         if (peers == NULL) {
             return NGX_ERROR;
         }
 
-        peers->single = (n == 1);
         peers->number = n;
         peers->name = &us->host;
 
@@ -465,14 +450,12 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
             return NGX_OK;
         }
 
-        backup = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_fair_rr_peers_t)
+        backup = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_fair_peers_t)
                               + sizeof(ngx_http_upstream_fair_peer_t) * (n - 1));
         if (backup == NULL) {
             return NGX_ERROR;
         }
 
-        peers->single = 0;
-        backup->single = 0;
         backup->number = n;
         backup->name = &us->host;
 
@@ -532,13 +515,12 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
 
     n = u.naddrs;
 
-    peers = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_fair_rr_peers_t)
+    peers = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_fair_peers_t)
                               + sizeof(ngx_http_upstream_fair_peer_t) * (n - 1));
     if (peers == NULL) {
         return NGX_ERROR;
     }
 
-    peers->single = (n == 1);
     peers->number = n;
     peers->name = &us->host;
 
@@ -576,9 +558,8 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     if (peers == NULL) {
         return NGX_ERROR;
     }
-    peers->rrp = us->peer.data;
-    us->peer.data = peers;
-    n = peers->rrp->number;
+    peers = us->peer.data;
+    n = peers->number;
 
     shm_name = ngx_palloc(cf->pool, sizeof *shm_name);
     shm_name->len = sizeof("upstream_fair");
@@ -687,7 +668,7 @@ ngx_http_upstream_fair_try_peer(ngx_peer_connection_t *pc,
     if (ngx_bitvector_test(fp->tried, peer_id))
         return NGX_BUSY;
 
-    peer = &fp->rrp->peer[peer_id];
+    peer = &fp->peers->peer[peer_id];
 
     if (!peer->down) {
         if (peer->max_fails == 0 || peer->fails < peer->max_fails) {
@@ -716,7 +697,7 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
     ngx_uint_t                          best_sched_score = UINT_MAX, sched_score;
     ngx_http_upstream_fair_peer_t      *peer;
 
-    npeers = fp->rrp->number;
+    npeers = fp->peers->number;
 
     /* just a single backend */
     if (npeers == 1) {
@@ -729,7 +710,7 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
     /* any idle backends? */
     for (i = 0, n = fp->current; i < npeers; i++, n = (n + 1) % npeers) {
         if (ngx_atomic_fetch_add(&fp->shared[n].nreq, 0) == 0 &&
-            fp->rrp->peer[n].fails == 0 &&
+            fp->peers->peer[n].fails == 0 &&
             ngx_http_upstream_fair_try_peer(pc, fp, n, now) == NGX_OK) {
 
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] peer %i is idle", n);
@@ -754,7 +735,7 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
             continue;
         }
 
-        peer = &fp->rrp->peer[n];
+        peer = &fp->peers->peer[n];
         fsc = fp->shared[n];
         sched_score = ngx_http_upstream_fair_sched_score(pc, &fsc, peer, n);
 
@@ -779,7 +760,7 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
         }
     }
 
-    peer = &fp->rrp->peer[*peer_id];
+    peer = &fp->peers->peer[*peer_id];
     ngx_bitvector_set(fp->tried, *peer_id);
     if (peer->current_weight-- == 0) {
         peer->current_weight = peer->weight;
@@ -798,7 +779,7 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
     ngx_http_upstream_fair_peer_t      *peer;
 
     peer_id = fp->current;
-    fp->current = (fp->current + 1) % fp->rrp->number;
+    fp->current = (fp->current + 1) % fp->peers->number;
 
     ret = ngx_http_upstream_choose_fair_peer(pc, fp, &peer_id);
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] fp->current = %d, peer_id = %d, ret = %d",
@@ -808,17 +789,17 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
         pc->tries--;
 
     if (ret == NGX_BUSY) {
-        for (i = 0; i < fp->rrp->number; i++) {
-            fp->rrp->peer[i].fails = 0;
+        for (i = 0; i < fp->peers->number; i++) {
+            fp->peers->peer[i].fails = 0;
         }
 
-        pc->name = fp->rrp->name;
+        pc->name = fp->peers->name;
         fp->current = NGX_PEER_INVALID;
         return NGX_BUSY;
     }
 
     /* assert(ret == NGX_OK); */
-    peer = &fp->rrp->peer[peer_id];
+    peer = &fp->peers->peer[peer_id];
     fp->current = peer_id;
     fp->peers->current = peer_id;
     pc->sockaddr = peer->sockaddr;
@@ -849,12 +830,12 @@ ngx_http_upstream_free_fair_peer(ngx_peer_connection_t *pc, void *data,
         ngx_http_upstream_fair_update_nreq(data, -1, pc->log);
     }
 
-    if (fp->rrp->number == 1) {
+    if (fp->peers->number == 1) {
         pc->tries = 0;
     }
 
     if (state & NGX_PEER_FAILED) {
-        peer = &fp->rrp->peer[fp->current];
+        peer = &fp->peers->peer[fp->current];
 
         peer->fails++;
         peer->accessed = ngx_time();
@@ -944,7 +925,7 @@ ngx_http_upstream_fair_shm_alloc(ngx_http_upstream_fair_peers_t *usfp, ngx_log_t
 
     usfp->shared = ngx_slab_alloc_locked(shpool,
         sizeof(ngx_http_upstream_fair_shm_block_t) +
-        (usfp->rrp->number - 1) * sizeof(ngx_http_upstream_fair_shared_t));
+        (usfp->number - 1) * sizeof(ngx_http_upstream_fair_shared_t));
 
     if (!usfp->shared) {
         ngx_shmtx_unlock(&shpool->mutex);
@@ -964,7 +945,7 @@ ngx_http_upstream_fair_shm_alloc(ngx_http_upstream_fair_peers_t *usfp, ngx_log_t
     usfp->shared->cycle = usfp->cycle;
     usfp->shared->peers = usfp;
 
-    for (i = 0; i < usfp->rrp->number; i++) {
+    for (i = 0; i < usfp->number; i++) {
             usfp->shared->stats[i].nreq = 0;
             usfp->shared->stats[i].last_active = ngx_current_msec;
     }
@@ -995,8 +976,8 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
 
     usfp = us->peer.data;
 
-    fp->tried = ngx_bitvector_alloc(r->pool, usfp->rrp->number, &fp->data);
-    fp->done = ngx_bitvector_alloc(r->pool, usfp->rrp->number, &fp->data2);
+    fp->tried = ngx_bitvector_alloc(r->pool, usfp->number, &fp->data);
+    fp->done = ngx_bitvector_alloc(r->pool, usfp->number, &fp->data2);
 
     if (fp->tried == NULL) {
         return NGX_ERROR;
@@ -1006,13 +987,12 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
     ngx_http_upstream_fair_shm_alloc(usfp, r->connection->log);
 
     fp->shared = &usfp->shared->stats[0];
-    fp->rrp = usfp->rrp;
     fp->current = usfp->current;
     fp->peers = usfp;
 
     r->upstream->peer.get = ngx_http_upstream_get_fair_peer;
     r->upstream->peer.free = ngx_http_upstream_free_fair_peer;
-    r->upstream->peer.tries = usfp->rrp->number;
+    r->upstream->peer.tries = usfp->number;
 #if (NGX_HTTP_SSL)
     r->upstream->peer.set_session =
                                ngx_http_upstream_fair_set_session;
@@ -1036,10 +1016,10 @@ ngx_http_upstream_fair_set_session(ngx_peer_connection_t *pc, void *data)
     if (fp->current == NGX_PEER_INVALID)
         return NGX_OK;
 
-    peer = &fp->rrp->peer[fp->current];
+    peer = &fp->peers->peer[fp->current];
 
     /* TODO: threads only mutex */
-    /* ngx_lock_mutex(fp->rrp->peers->mutex); */
+    /* ngx_lock_mutex(fp->peers->mutex); */
 
     ssl_session = peer->ssl_session;
 
@@ -1049,7 +1029,7 @@ ngx_http_upstream_fair_set_session(ngx_peer_connection_t *pc, void *data)
                    "set session: %p:%d",
                    ssl_session, ssl_session ? ssl_session->references : 0);
 
-    /* ngx_unlock_mutex(fp->rrp->peers->mutex); */
+    /* ngx_unlock_mutex(fp->peers->mutex); */
 
     return rc;
 }
@@ -1074,15 +1054,15 @@ ngx_http_upstream_fair_save_session(ngx_peer_connection_t *pc, void *data)
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
                    "save session: %p:%d", ssl_session, ssl_session->references);
 
-    peer = &fp->rrp->peer[fp->current];
+    peer = &fp->peers->peer[fp->current];
 
     /* TODO: threads only mutex */
-    /* ngx_lock_mutex(fp->rrp->peers->mutex); */
+    /* ngx_lock_mutex(fp->peers->mutex); */
 
     old_ssl_session = peer->ssl_session;
     peer->ssl_session = ssl_session;
 
-    /* ngx_unlock_mutex(fp->rrp->peers->mutex); */
+    /* ngx_unlock_mutex(fp->peers->mutex); */
 
     if (old_ssl_session) {
 
