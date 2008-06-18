@@ -1,14 +1,13 @@
 define show_fair_peer
 	set $n = (ngx_http_upstream_fair_shm_block_t *)$arg0
 	set $peers = $n->peers
-	set $rr_peers = $peers->rrp
-	printf "upstream id: 0x%08x, current peer: %d/%d\n", $n->node.key, $peers->current, $rr_peers->number
+	printf "upstream id: 0x%08x, current peer: %d/%d\n", $n->node.key, $peers->current, $peers->number
 	set $i = 0
-	while $i < $rr_peers->number
-		printf "peer %d: %s weight: %d/%d fails: %d/%d acc: %d down: %d nreq: %u last_act: %u\n", $i, $rr_peers->peer[$i].name.data,\
-			$rr_peers->peer[$i].current_weight, $rr_peers->peer[$i].weight,\
-			$rr_peers->peer[$i].fails, $rr_peers->peer[$i].max_fails,\
-			$rr_peers->peer[$i].accessed, $rr_peers->peer[$i].down,\
+	while $i < $peers->number
+		printf "peer %d: %s weight: %d/%d fails: %d/%d acc: %d down: %d nreq: %u last_act: %u\n", $i, $peers->peer[$i].name.data,\
+			$peers->peer[$i].current_weight, $peers->peer[$i].weight,\
+			$peers->peer[$i].fails, $peers->peer[$i].max_fails,\
+			$peers->peer[$i].accessed, $peers->peer[$i].down,\
 			$n->stats[$i].nreq, $n->stats[$i].last_active
 		set $i = $i + 1
 	end
