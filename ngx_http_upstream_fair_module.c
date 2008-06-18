@@ -25,11 +25,49 @@ typedef struct {
     ngx_http_upstream_fair_shared_t     stats[1];
 } ngx_http_upstream_fair_shm_block_t;
 
+typedef struct {
+    struct sockaddr                    *sockaddr;
+    socklen_t                           socklen;
+    ngx_str_t                           name;
+
+    ngx_uint_t                          weight;
+    ngx_uint_t                          max_fails;
+    time_t                              fail_timeout;
+
+    /* TODO: move these to shared memory */
+    ngx_uint_t                          fails;
+    ngx_uint_t                          current_weight;
+    time_t                              accessed;   /* TODO: get rid of it */
+
+    ngx_uint_t                          down:1;
+
+#if (NGX_HTTP_SSL)
+    ngx_ssl_session_t                  *ssl_session;    /* local to a process */
+#endif
+
+} ngx_http_upstream_fair_peer_t;
+
+typedef struct ngx_http_upstream_fair_rr_peers_s ngx_http_upstream_fair_rr_peers_t;
+
+struct ngx_http_upstream_fair_rr_peers_s {
+    ngx_uint_t                      single;        /* unsigned  single:1; */
+    ngx_uint_t                      number;
+    ngx_uint_t                      last_cached;
+
+ /* ngx_mutex_t                    *mutex; */
+    ngx_connection_t              **cached;
+
+    ngx_str_t                      *name;
+
+    ngx_http_upstream_fair_rr_peers_t   *next;
+
+    ngx_http_upstream_fair_peer_t     peer[1];
+};
 
 struct ngx_http_upstream_fair_peers_s {
     ngx_cycle_t                        *cycle;
     ngx_http_upstream_fair_shm_block_t *shared;
-    ngx_http_upstream_rr_peers_t       *rrp;
+    ngx_http_upstream_fair_rr_peers_t  *rrp;
     ngx_uint_t                          current;
     ngx_uint_t                          size_err:1;
 };
@@ -40,7 +78,7 @@ struct ngx_http_upstream_fair_peers_s {
 
 typedef struct {
     ngx_http_upstream_fair_shared_t    *shared;
-    ngx_http_upstream_rr_peers_t       *rrp;
+    ngx_http_upstream_fair_rr_peers_t  *rrp;
     ngx_http_upstream_fair_peers_t     *peers;
     ngx_uint_t                          current;
     uintptr_t                          *tried;
@@ -344,10 +382,10 @@ ngx_http_upstream_fair(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 static ngx_int_t
 ngx_http_upstream_cmp_servers(const void *one, const void *two)
 {
-    ngx_http_upstream_rr_peer_t  *first, *second;
+    const ngx_http_upstream_fair_peer_t  *first, *second;
 
-    first = (ngx_http_upstream_rr_peer_t *) one;
-    second = (ngx_http_upstream_rr_peer_t *) two;
+    first = one;
+    second = two;
 
     return (first->weight < second->weight);
 }
@@ -360,9 +398,7 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     ngx_url_t                      u;
     ngx_uint_t                     i, j, n;
     ngx_http_upstream_server_t    *server;
-    ngx_http_upstream_rr_peers_t  *peers, *backup;
-
-    us->peer.init = ngx_http_upstream_init_round_robin_peer;
+    ngx_http_upstream_fair_rr_peers_t  *peers, *backup;
 
     if (us->servers) {
         server = us->servers->elts;
@@ -377,8 +413,8 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
             n += server[i].naddrs;
         }
 
-        peers = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_rr_peers_t)
-                              + sizeof(ngx_http_upstream_rr_peer_t) * (n - 1));
+        peers = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_fair_rr_peers_t)
+                              + sizeof(ngx_http_upstream_fair_peer_t) * (n - 1));
         if (peers == NULL) {
             return NGX_ERROR;
         }
@@ -410,7 +446,7 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
         us->peer.data = peers;
 
         ngx_sort(&peers->peer[0], (size_t) n,
-                 sizeof(ngx_http_upstream_rr_peer_t),
+                 sizeof(ngx_http_upstream_fair_peer_t),
                  ngx_http_upstream_cmp_servers);
 
         /* backup servers */
@@ -429,8 +465,8 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
             return NGX_OK;
         }
 
-        backup = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_rr_peers_t)
-                              + sizeof(ngx_http_upstream_rr_peer_t) * (n - 1));
+        backup = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_fair_rr_peers_t)
+                              + sizeof(ngx_http_upstream_fair_peer_t) * (n - 1));
         if (backup == NULL) {
             return NGX_ERROR;
         }
@@ -463,7 +499,7 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
         peers->next = backup;
 
         ngx_sort(&backup->peer[0], (size_t) n,
-                 sizeof(ngx_http_upstream_rr_peer_t),
+                 sizeof(ngx_http_upstream_fair_peer_t),
                  ngx_http_upstream_cmp_servers);
 
         return NGX_OK;
@@ -496,8 +532,8 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
 
     n = u.naddrs;
 
-    peers = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_rr_peers_t)
-                              + sizeof(ngx_http_upstream_rr_peer_t) * (n - 1));
+    peers = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_fair_rr_peers_t)
+                              + sizeof(ngx_http_upstream_fair_peer_t) * (n - 1));
     if (peers == NULL) {
         return NGX_ERROR;
     }
@@ -611,7 +647,7 @@ ngx_http_upstream_fair_update_nreq(ngx_http_upstream_fair_peer_data_t *fp, int d
 static ngx_uint_t
 ngx_http_upstream_fair_sched_score(ngx_peer_connection_t *pc,
     ngx_http_upstream_fair_shared_t *fs,
-    ngx_http_upstream_rr_peer_t *peer, ngx_uint_t n)
+    ngx_http_upstream_fair_peer_t *peer, ngx_uint_t n)
 {
     ngx_msec_t                          last_active_delta;
 
@@ -646,7 +682,7 @@ ngx_http_upstream_fair_try_peer(ngx_peer_connection_t *pc,
     ngx_uint_t peer_id,
     time_t now)
 {
-    ngx_http_upstream_rr_peer_t        *peer;
+    ngx_http_upstream_fair_peer_t        *peer;
 
     if (ngx_bitvector_test(fp->tried, peer_id))
         return NGX_BUSY;
@@ -678,7 +714,7 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
     ngx_http_upstream_fair_shared_t     fsc;
     time_t                              now;
     ngx_uint_t                          best_sched_score = UINT_MAX, sched_score;
-    ngx_http_upstream_rr_peer_t        *peer;
+    ngx_http_upstream_fair_peer_t      *peer;
 
     npeers = fp->rrp->number;
 
@@ -759,7 +795,7 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
     ngx_int_t                           ret;
     ngx_uint_t                          peer_id, i;
     ngx_http_upstream_fair_peer_data_t *fp = data;
-    ngx_http_upstream_rr_peer_t        *peer;
+    ngx_http_upstream_fair_peer_t      *peer;
 
     peer_id = fp->current;
     fp->current = (fp->current + 1) % fp->rrp->number;
@@ -799,7 +835,7 @@ ngx_http_upstream_free_fair_peer(ngx_peer_connection_t *pc, void *data,
     ngx_uint_t state)
 {
     ngx_http_upstream_fair_peer_data_t     *fp = data;
-    ngx_http_upstream_rr_peer_t            *peer;
+    ngx_http_upstream_fair_peer_t          *peer;
 
     ngx_log_debug4(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] fp->current = %d, state = %ui, pc->tries = %d, pc->data = %p",
         fp->current, state, pc->tries, pc->data);
@@ -993,9 +1029,9 @@ ngx_http_upstream_fair_set_session(ngx_peer_connection_t *pc, void *data)
 {
     ngx_http_upstream_fair_peer_data_t  *fp = data;
 
-    ngx_int_t                     rc;
-    ngx_ssl_session_t            *ssl_session;
-    ngx_http_upstream_rr_peer_t  *peer;
+    ngx_int_t                      rc;
+    ngx_ssl_session_t             *ssl_session;
+    ngx_http_upstream_fair_peer_t *peer;
 
     if (fp->current == NGX_PEER_INVALID)
         return NGX_OK;
@@ -1023,8 +1059,8 @@ ngx_http_upstream_fair_save_session(ngx_peer_connection_t *pc, void *data)
 {
     ngx_http_upstream_fair_peer_data_t  *fp = data;
 
-    ngx_ssl_session_t            *old_ssl_session, *ssl_session;
-    ngx_http_upstream_rr_peer_t  *peer;
+    ngx_ssl_session_t             *old_ssl_session, *ssl_session;
+    ngx_http_upstream_fair_peer_t *peer;
 
     if (fp->current == NGX_PEER_INVALID)
         return;
