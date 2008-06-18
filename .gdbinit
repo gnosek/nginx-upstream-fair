@@ -4,11 +4,12 @@ define show_fair_peer
 	printf "upstream id: 0x%08x, current peer: %d/%d\n", $n->node.key, $peers->current, $peers->number
 	set $i = 0
 	while $i < $peers->number
-		printf "peer %d: %s weight: %d/%d fails: %d/%d acc: %d down: %d nreq: %u last_act: %u\n", $i, $peers->peer[$i].name.data,\
-			$peers->peer[$i].current_weight, $peers->peer[$i].weight,\
-			$peers->peer[$i].fails, $peers->peer[$i].max_fails,\
-			$peers->peer[$i].accessed, $peers->peer[$i].down,\
-			$n->stats[$i].nreq, $n->stats[$i].last_active
+		set $peer = &$peers->peer[$i]
+		printf "peer %d: %s weight: %d/%d fails: %d/%d acc: %d down: %d nreq: %u last_act: %u\n", $i, $peer->name.data,\
+			$peer->shared->current_weight, $peer->weight,\
+			$peer->shared->fails, $peer->max_fails,\
+			$peer->accessed, $peer->down,\
+			$peer->shared->nreq, $peer->shared->last_active
 		set $i = $i + 1
 	end
 	printf "-----------------\n"
