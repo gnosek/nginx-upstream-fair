@@ -746,7 +746,7 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
             sched_score /= weight;
         }
 
-        ngx_log_debug7(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] bss = %ui, ss = %ui (n = %d, w = %d/%d, f = %d/%d, weight = %d)",
+        ngx_log_debug8(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] bss = %ui, ss = %ui (n = %d, w = %d/%d, f = %d/%d, weight = %d)",
             best_sched_score, sched_score, n, peer->shared->current_weight, peer->weight, peer->shared->fails, peer->max_fails, weight);
 
         if (sched_score <= best_sched_score) {
