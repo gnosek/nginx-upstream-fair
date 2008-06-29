@@ -1,7 +1,7 @@
 define show_fair_peer
 	set $n = (ngx_http_upstream_fair_shm_block_t *)$arg0
 	set $peers = $n->peers
-	printf "upstream id: 0x%08x, current peer: %d/%d\n", $n->node.key, $peers->current, $peers->number
+	printf "upstream id: 0x%08x (%s), current peer: %d/%d\n", $n->node.key, $peers->name.data, $peers->current, $peers->number
 	set $i = 0
 	while $i < $peers->number
 		set $peer = &$peers->peer[$i]
