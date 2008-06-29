@@ -86,6 +86,11 @@ static char *ngx_http_upstream_fair(ngx_conf_t *cf, ngx_command_t *cmd,
 static char *ngx_http_upstream_fair_set_shm_size(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 
+#if (NGX_HTTP_EXTENDED_STATUS)
+static ngx_chain_t *ngx_http_upstream_fair_report_status(ngx_http_request_t *r,
+    ngx_int_t *length);
+#endif
+
 #if (NGX_HTTP_SSL)
 static ngx_int_t ngx_http_upstream_fair_set_session(ngx_peer_connection_t *pc,
     void *data);
@@ -124,7 +129,11 @@ static ngx_http_module_t  ngx_http_upstream_fair_module_ctx = {
     NULL,                                  /* merge server configuration */
 
     NULL,                                  /* create location configuration */
-    NULL                                   /* merge location configuration */
+    NULL,                                  /* merge location configuration */
+
+#if (NGX_HTTP_EXTENDED_STATUS)
+    ngx_http_upstream_fair_report_status,
+#endif
 };
 
 
@@ -1076,4 +1085,114 @@ ngx_http_upstream_fair_save_session(ngx_peer_connection_t *pc, void *data)
 }
 
 #endif
+
+#if (NGX_HTTP_EXTENDED_STATUS)
+static void
+ngx_http_upstream_fair_walk_status(ngx_pool_t *pool, ngx_chain_t *cl, ngx_int_t *length,
+    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)
+{
+    ngx_http_upstream_fair_shm_block_t     *s_node = (ngx_http_upstream_fair_shm_block_t *) node;
+    ngx_http_upstream_fair_peers_t         *peers;
+    ngx_chain_t                            *new_cl;
+    ngx_buf_t                              *b;
+    ngx_uint_t                              size, i;
+
+    if (node == sentinel) {
+        return;
+    }
+
+    if (node->left != sentinel) {
+        ngx_http_upstream_fair_walk_status(pool, cl, length, node->left, sentinel);
+    }
+
+    size = 200 + s_node->peers->number * 120; /* LOTS of slack */
+
+    b = ngx_create_temp_buf(pool, size);
+    if (!b) {
+        goto next;
+    }
+
+    new_cl = ngx_alloc_chain_link(pool);
+    if (!new_cl) {
+        goto next;
+    }
+
+    new_cl->buf = b;
+    new_cl->next = NULL;
+    cl->next = new_cl;
+
+    peers = s_node->peers;
+
+    b->last = ngx_sprintf(b->last, "upstream %V (%p): current peer %d/%d\n", peers->name, (void*) node, peers->current, peers->number);
+    for (i = 0; i < peers->number; i++) {
+        ngx_http_upstream_fair_peer_t *peer = &peers->peer[i];
+        ngx_http_upstream_fair_shared_t *sh = peer->shared;
+        b->last = ngx_sprintf(b->last, " peer %d: %V weight: %d/%d, fails: %d/%d, acc: %d, down: %d, nreq: %d, last_act: %ui\n",
+            i, &peer->name, sh->current_weight, peer->weight, sh->fails, peer->max_fails, peer->accessed, peer->down,
+            sh->nreq, sh->last_active);
+    }
+    b->last = ngx_sprintf(b->last, "\n");
+    b->last_buf = 1;
+
+    *length += b->last - b->pos;
+
+    if (cl->buf) {
+        cl->buf->last_buf = 0;
+    }
+
+next:
+
+    if (node->right != sentinel) {
+        ngx_http_upstream_fair_walk_status(pool, cl, length, node->right, sentinel);
+    }
+}
+
+static ngx_chain_t*
+ngx_http_upstream_fair_report_status(ngx_http_request_t *r, ngx_int_t *length)
+{
+    ngx_buf_t              *b;
+    ngx_chain_t            *cl, *tree_cl;
+    ngx_slab_pool_t        *shpool;
+
+    b = ngx_create_temp_buf(r->pool, sizeof("\nupstream_fair status report:\n"));
+    if (!b) {
+        return NULL;
+    }
+
+    cl = ngx_alloc_chain_link(r->pool);
+    tree_cl = ngx_alloc_chain_link(r->pool);
+    if (!cl || !tree_cl) {
+        return NULL;
+    }
+    cl->next = tree_cl;
+    cl->buf = b;
+
+    tree_cl->next = NULL;
+    tree_cl->buf = NULL;
+
+    b->last = ngx_cpymem(b->last, "\nupstream_fair status report:\n",
+        sizeof("\nupstream_fair status report:\n") - 1);
+
+    *length = b->last - b->pos;
+
+    shpool = (ngx_slab_pool_t *)ngx_http_upstream_fair_shm_zone->shm.addr;
+
+    ngx_shmtx_lock(&shpool->mutex);
+
+    ngx_http_upstream_fair_walk_status(r->pool, cl,
+        length,
+        ngx_http_upstream_fair_rbtree->root,
+        ngx_http_upstream_fair_rbtree->sentinel);
+
+    ngx_shmtx_unlock(&shpool->mutex);
+
+    if (!cl->next->buf) {
+        /* no upstream_fair status to report */
+        return NULL;
+    }
+
+    return cl;
+}
+#endif
+
 /* vim: set et ts=4 sw=4: */
