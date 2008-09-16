@@ -46,11 +46,14 @@ typedef struct {
 
 } ngx_http_upstream_fair_peer_t;
 
+#define NGX_HTTP_UPSTREAM_FAIR_NO_RR 0x4000000
+
 struct ngx_http_upstream_fair_peers_s {
     ngx_cycle_t                        *cycle;
     ngx_http_upstream_fair_shm_block_t *shared;
     ngx_uint_t                          current;
     ngx_uint_t                          size_err:1;
+    ngx_uint_t                          no_rr:1;
 
     ngx_uint_t                          number;
     ngx_str_t                          *name;
@@ -60,7 +63,6 @@ struct ngx_http_upstream_fair_peers_s {
 
 
 #define NGX_PEER_INVALID (~0UL)
-
 
 typedef struct {
     ngx_http_upstream_fair_peers_t     *peers;
@@ -101,7 +103,7 @@ static void ngx_http_upstream_fair_save_session(ngx_peer_connection_t *pc,
 static ngx_command_t  ngx_http_upstream_fair_commands[] = {
 
     { ngx_string("fair"),
-      NGX_HTTP_UPS_CONF|NGX_CONF_NOARGS,
+      NGX_HTTP_UPS_CONF|NGX_CONF_ANY,
       ngx_http_upstream_fair,
       0,
       0,
@@ -357,6 +359,18 @@ static char *
 ngx_http_upstream_fair(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_upstream_srv_conf_t  *uscf;
+    ngx_uint_t i;
+    ngx_uint_t extra_peer_flags = 0;
+
+    for (i = 1; i < cf->args->nelts; i++) {
+        ngx_str_t *value = cf->args->elts;
+        if (ngx_strcmp(value[i].data, "no-rr") == 0) {
+            extra_peer_flags |= NGX_HTTP_UPSTREAM_FAIR_NO_RR;
+        } else {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "Invalid `fair' parameter `%V'", &value[i]);
+            return NGX_CONF_ERROR;
+        }
+    }
 
     uscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module);
 
@@ -366,7 +380,8 @@ ngx_http_upstream_fair(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                   |NGX_HTTP_UPSTREAM_WEIGHT
                   |NGX_HTTP_UPSTREAM_MAX_FAILS
                   |NGX_HTTP_UPSTREAM_FAIL_TIMEOUT
-                  |NGX_HTTP_UPSTREAM_DOWN;
+                  |NGX_HTTP_UPSTREAM_DOWN
+                  |extra_peer_flags;
 
     return NGX_CONF_OK;
 }
@@ -582,7 +597,12 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
 
     peers->cycle = cf->cycle;
     peers->shared = NULL;
-    peers->current = n - 1;
+    if (us->flags & NGX_HTTP_UPSTREAM_FAIR_NO_RR) {
+        peers->no_rr = 1;
+        peers->current = 0;
+    } else {
+        peers->current = n - 1;
+    }
     peers->size_err = 0;
 
     us->peer.init = ngx_http_upstream_init_fair_peer;
@@ -805,7 +825,9 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
     /* assert(ret == NGX_OK); */
     peer = &fp->peers->peer[peer_id];
     fp->current = peer_id;
-    fp->peers->current = peer_id;
+    if (!fp->peers->no_rr) {
+        fp->peers->current = peer_id;
+    }
     pc->sockaddr = peer->sockaddr;
     pc->socklen = peer->socklen;
     pc->name = &peer->name;
