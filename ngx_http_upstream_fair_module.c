@@ -1147,6 +1147,9 @@ ngx_http_upstream_fair_walk_status(ngx_pool_t *pool, ngx_chain_t *cl, ngx_int_t 
     for (i = 0; i < peers->number; i++) {
         ngx_http_upstream_fair_peer_t *peer = &peers->peer[i];
         ngx_http_upstream_fair_shared_t *sh = peer->shared;
+        if (!sh) {
+            continue;
+        }
         b->last = ngx_sprintf(b->last, " peer %d: %V weight: %d/%d, fails: %d/%d, acc: %d, down: %d, nreq: %d, total_req: %ui, last_req: %ui\n",
             i, &peer->name, sh->current_weight, peer->weight, sh->fails, peer->max_fails, peer->accessed, peer->down,
             sh->nreq, sh->total_req, sh->last_req_id);
