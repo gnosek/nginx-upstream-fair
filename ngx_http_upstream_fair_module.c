@@ -11,7 +11,8 @@
 
 typedef struct {
     ngx_atomic_t                        nreq;
-    ngx_atomic_t                        last_active;
+    ngx_atomic_t                        total_req;
+    ngx_atomic_t                        last_req_id;
     ngx_atomic_t                        fails;
     ngx_atomic_t                        current_weight;
 } ngx_http_upstream_fair_shared_t;
@@ -24,6 +25,7 @@ typedef struct {
     ngx_cycle_t                        *cycle;
     ngx_http_upstream_fair_peers_t     *peers;      /* forms a unique cookie together with cycle */
     ngx_int_t                           refcount;   /* accessed only under shmtx_lock */
+    ngx_uint_t                          total_requests;
     ngx_http_upstream_fair_shared_t     stats[1];
 } ngx_http_upstream_fair_shm_block_t;
 
@@ -597,11 +599,9 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
 
     peers->cycle = cf->cycle;
     peers->shared = NULL;
+    peers->current = n - 1;
     if (us->flags & NGX_HTTP_UPSTREAM_FAIR_NO_RR) {
         peers->no_rr = 1;
-        peers->current = 0;
-    } else {
-        peers->current = n - 1;
     }
     peers->size_err = 0;
 
@@ -617,64 +617,58 @@ ngx_http_upstream_fair_update_nreq(ngx_http_upstream_fair_peer_data_t *fp, int d
     ngx_http_upstream_fair_shared_t     *fs;
 
     fs = fp->peers->peer[fp->current].shared;
-
     ngx_atomic_fetch_add(&fs->nreq, delta);
-
-    fs->last_active = ngx_current_msec;
-
+    if (delta > 0) {
+        ngx_atomic_fetch_add(&fs->total_req, 1);
+    }
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0, "[upstream_fair] nreq for peer %ui now %d", fp->current, fs->nreq);
 }
 
 /*
- * SCHED_TIME_BITS is the portion of an ngx_uint_t which represents the
- * last_time_delta part (time since last activity in msec). The rest
- * (top bits) represents the number of currently processed requests.
+ * SCHED_COUNTER_BITS is the portion of an ngx_uint_t which represents
+ * the req_delta part (number of requests serviced on _other_
+ * backends). The rest (top bits) represents the number of currently
+ * processed requests.
  *
  * The value is not too critical because overflow is handled via
- * saturation. With the default value of 24, scheduling is exact for
- * requests shorter than 16777 sec and for less than 256 requests per
- * backend (on 32-bit architectures). Beyond these limits, the algorithm
- * essentially falls back to pure weighted round-robin
+ * saturation. With the default value of 20, scheduling is exact for
+ * fewer than 4k concurrent requests per backend (on 32-bit
+ * architectures) and fewer than 1M concurrent requests to all backends
+ * together. Beyond these limits, the algorithm essentially falls back
+ * to pure weighted round-robin.
  *
- * A higher score means less suitable -- this changed from previous
- * releases.
+ * A higher score means less suitable.
  *
  * The `delta' parameter is bit-negated so that high values yield low
  * scores and get chosen more often.
  */
 
-#define SCHED_TIME_BITS 24
-#define SCHED_NREQ_MAX ((~0UL) >> SCHED_TIME_BITS)
-#define SCHED_TIME_MAX ((1 << SCHED_TIME_BITS) - 1)
-#define SCHED_SCORE(nreq,delta) (((nreq) << SCHED_TIME_BITS) | (~(delta)))
+#define SCHED_COUNTER_BITS 20
+#define SCHED_NREQ_MAX ((~0UL) >> SCHED_COUNTER_BITS)
+#define SCHED_COUNTER_MAX ((1 << SCHED_COUNTER_BITS) - 1)
+#define SCHED_SCORE(nreq,delta) (((nreq) << SCHED_COUNTER_BITS) | (~(delta)))
 #define ngx_upstream_fair_min(a,b) (((a) < (b)) ? (a) : (b))
 
 static ngx_uint_t
 ngx_http_upstream_fair_sched_score(ngx_peer_connection_t *pc,
-    ngx_http_upstream_fair_shared_t *fs,
-    ngx_http_upstream_fair_peer_t *peer, ngx_uint_t n)
+    ngx_http_upstream_fair_peer_data_t *fp,
+    ngx_uint_t n)
 {
-    ngx_msec_t                          last_active_delta;
-
-    last_active_delta = ngx_current_msec - fs->last_active;
-    if ((ngx_int_t) last_active_delta < 0) {
-        ngx_log_error(NGX_LOG_WARN, pc->log, 0, "[upstream_fair] Clock skew of at least %i msec detected", -(ngx_int_t) last_active_delta);
-
-        /* a pretty arbitrary value */
-        last_active_delta = abs(last_active_delta);
-    }
+    ngx_http_upstream_fair_peer_t      *peer = &fp->peers->peer[n];
+    ngx_http_upstream_fair_shared_t    *fs = peer->shared;
+    ngx_uint_t req_delta = fp->peers->shared->total_requests - fs->last_req_id;
 
     /* sanity check */
     if ((ngx_int_t)fs->nreq < 0) {
         ngx_log_error(NGX_LOG_WARN, pc->log, 0, "[upstream_fair] upstream %ui has negative nreq (%i)", n, fs->nreq);
-        return SCHED_SCORE(0, last_active_delta);
+        return SCHED_SCORE(0, req_delta);
     }
 
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] nreq = %i, last_active_delta = %ui", fs->nreq, last_active_delta);
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] nreq = %i, req_delta = %ui", fs->nreq, req_delta);
 
     return SCHED_SCORE(
         ngx_upstream_fair_min(fs->nreq, SCHED_NREQ_MAX),
-        ngx_upstream_fair_min(last_active_delta, SCHED_TIME_MAX));
+        ngx_upstream_fair_min(req_delta, SCHED_COUNTER_MAX));
 }
 
 /*
@@ -761,7 +755,7 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
 
         peer = &fp->peers->peer[n];
         fsc = *peer->shared;
-        sched_score = ngx_http_upstream_fair_sched_score(pc, &fsc, peer, n);
+        sched_score = ngx_http_upstream_fair_sched_score(pc, fp, n);
 
         /*
          * take peer weight into account
@@ -832,6 +826,7 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
     pc->socklen = peer->socklen;
     pc->name = &peer->name;
 
+    peer->shared->last_req_id = fp->peers->shared->total_requests;
     ngx_http_upstream_fair_update_nreq(data, 1, pc->log);
     return ret;
 }
@@ -970,10 +965,12 @@ ngx_http_upstream_fair_shm_alloc(ngx_http_upstream_fair_peers_t *usfp, ngx_log_t
     usfp->shared->refcount = 1;
     usfp->shared->cycle = usfp->cycle;
     usfp->shared->peers = usfp;
+    usfp->shared->total_requests = 0;
 
     for (i = 0; i < usfp->number; i++) {
             usfp->shared->stats[i].nreq = 0;
-            usfp->shared->stats[i].last_active = ngx_current_msec;
+            usfp->shared->stats[i].last_req_id = 0;
+            usfp->shared->stats[i].total_req = 0;
     }
 
     ngx_rbtree_insert(ngx_http_upstream_fair_rbtree, &usfp->shared->node);
@@ -1015,6 +1012,7 @@ ngx_http_upstream_init_fair_peer(ngx_http_request_t *r,
 
     fp->current = usfp->current;
     fp->peers = usfp;
+    usfp->shared->total_requests++;
 
     for (n = 0; n < usfp->number; n++) {
         usfp->peer[n].shared = &usfp->shared->stats[n];
@@ -1145,13 +1143,13 @@ ngx_http_upstream_fair_walk_status(ngx_pool_t *pool, ngx_chain_t *cl, ngx_int_t 
 
     peers = s_node->peers;
 
-    b->last = ngx_sprintf(b->last, "upstream %V (%p): current peer %d/%d\n", peers->name, (void*) node, peers->current, peers->number);
+    b->last = ngx_sprintf(b->last, "upstream %V (%p): current peer %d/%d, total requests: %ui\n", peers->name, (void*) node, peers->current, peers->number, s_node->total_requests);
     for (i = 0; i < peers->number; i++) {
         ngx_http_upstream_fair_peer_t *peer = &peers->peer[i];
         ngx_http_upstream_fair_shared_t *sh = peer->shared;
-        b->last = ngx_sprintf(b->last, " peer %d: %V weight: %d/%d, fails: %d/%d, acc: %d, down: %d, nreq: %d, last_act: %ui\n",
+        b->last = ngx_sprintf(b->last, " peer %d: %V weight: %d/%d, fails: %d/%d, acc: %d, down: %d, nreq: %d, total_req: %ui, last_req: %ui\n",
             i, &peer->name, sh->current_weight, peer->weight, sh->fails, peer->max_fails, peer->accessed, peer->down,
-            sh->nreq, sh->last_active);
+            sh->nreq, sh->total_req, sh->last_req_id);
     }
     b->last = ngx_sprintf(b->last, "\n");
     b->last_buf = 1;

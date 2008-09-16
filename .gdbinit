@@ -5,11 +5,11 @@ define show_fair_peer
 	set $i = 0
 	while $i < $peers->number
 		set $peer = &$peers->peer[$i]
-		printf "peer %d: %s weight: %d/%d fails: %d/%d acc: %d down: %d nreq: %u last_act: %u\n", $i, $peer->name.data,\
+		printf "peer %d: %s weight: %d/%d fails: %d/%d acc: %d down: %d nreq: %u last_req_id: %u\n", $i, $peer->name.data,\
 			$peer->shared->current_weight, $peer->weight,\
 			$peer->shared->fails, $peer->max_fails,\
 			$peer->accessed, $peer->down,\
-			$peer->shared->nreq, $peer->shared->last_active
+			$peer->shared->nreq, $peer->shared->last_req_id
 		set $i = $i + 1
 	end
 	printf "-----------------\n"
