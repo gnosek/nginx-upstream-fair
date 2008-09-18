@@ -17,7 +17,6 @@ typedef struct {
     ngx_atomic_t                        current_weight;
 } ngx_http_upstream_fair_shared_t;
 
-
 typedef struct ngx_http_upstream_fair_peers_s ngx_http_upstream_fair_peers_t;
 
 typedef struct {
@@ -26,8 +25,12 @@ typedef struct {
     ngx_http_upstream_fair_peers_t     *peers;      /* forms a unique cookie together with cycle */
     ngx_int_t                           refcount;   /* accessed only under shmtx_lock */
     ngx_uint_t                          total_requests;
+    ngx_atomic_t                        lock;
     ngx_http_upstream_fair_shared_t     stats[1];
 } ngx_http_upstream_fair_shm_block_t;
+
+/* ngx_spinlock is defined without a matching unlock primitive */
+#define ngx_spinlock_unlock(lock)       (void) ngx_atomic_cmp_set(lock, ngx_pid, 0)
 
 typedef struct {
     ngx_http_upstream_fair_shared_t    *shared;
@@ -614,14 +617,10 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
 static void
 ngx_http_upstream_fair_update_nreq(ngx_http_upstream_fair_peer_data_t *fp, int delta, ngx_log_t *log)
 {
-    ngx_http_upstream_fair_shared_t     *fs;
+    ngx_uint_t                           nreq;
 
-    fs = fp->peers->peer[fp->current].shared;
-    ngx_atomic_fetch_add(&fs->nreq, delta);
-    if (delta > 0) {
-        ngx_atomic_fetch_add(&fs->total_req, 1);
-    }
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0, "[upstream_fair] nreq for peer %ui now %d", fp->current, fs->nreq);
+    nreq = (fp->peers->peer[fp->current].shared->nreq += delta);
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0, "[upstream_fair] nreq for peer %ui now %d", fp->current, nreq);
 }
 
 /*
@@ -795,10 +794,13 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
     ngx_uint_t                          peer_id, i;
     ngx_http_upstream_fair_peer_data_t *fp = data;
     ngx_http_upstream_fair_peer_t      *peer;
+    ngx_atomic_t                       *lock;
 
     peer_id = fp->current;
     fp->current = (fp->current + 1) % fp->peers->number;
 
+    lock = &fp->peers->shared->lock;
+    ngx_spinlock(lock, ngx_pid, 1024);
     ret = ngx_http_upstream_choose_fair_peer(pc, fp, &peer_id);
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] fp->current = %d, peer_id = %d, ret = %d",
         fp->current, peer_id, ret);
@@ -813,6 +815,7 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
 
         pc->name = fp->peers->name;
         fp->current = NGX_PEER_INVALID;
+        ngx_spinlock_unlock(lock);
         return NGX_BUSY;
     }
 
@@ -827,7 +830,9 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
     pc->name = &peer->name;
 
     peer->shared->last_req_id = fp->peers->shared->total_requests;
-    ngx_http_upstream_fair_update_nreq(data, 1, pc->log);
+    ngx_http_upstream_fair_update_nreq(fp, 1, pc->log);
+    ngx_atomic_fetch_add(&peer->shared->total_req, 1);
+    ngx_spinlock_unlock(lock);
     return ret;
 }
 
@@ -838,6 +843,7 @@ ngx_http_upstream_free_fair_peer(ngx_peer_connection_t *pc, void *data,
 {
     ngx_http_upstream_fair_peer_data_t     *fp = data;
     ngx_http_upstream_fair_peer_t          *peer;
+    ngx_atomic_t                           *lock;
 
     ngx_log_debug4(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] fp->current = %d, state = %ui, pc->tries = %d, pc->data = %p",
         fp->current, state, pc->tries, pc->data);
@@ -846,9 +852,11 @@ ngx_http_upstream_free_fair_peer(ngx_peer_connection_t *pc, void *data,
         return;
     }
 
+    lock = &fp->peers->shared->lock;
+    ngx_spinlock(lock, ngx_pid, 1024);
     if (!ngx_bitvector_test(fp->done, fp->current)) {
         ngx_bitvector_set(fp->done, fp->current);
-        ngx_http_upstream_fair_update_nreq(data, -1, pc->log);
+        ngx_http_upstream_fair_update_nreq(fp, -1, pc->log);
     }
 
     if (fp->peers->number == 1) {
@@ -861,6 +869,7 @@ ngx_http_upstream_free_fair_peer(ngx_peer_connection_t *pc, void *data,
         peer->shared->fails++;
         peer->accessed = ngx_time();
     }
+    ngx_spinlock_unlock(lock);
 }
 
 /*
