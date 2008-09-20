@@ -51,7 +51,12 @@ typedef struct {
 
 } ngx_http_upstream_fair_peer_t;
 
-#define NGX_HTTP_UPSTREAM_FAIR_NO_RR 0x4000000
+#define NGX_HTTP_UPSTREAM_FAIR_NO_RR            (1<<26)
+#define NGX_HTTP_UPSTREAM_FAIR_WEIGHT_MODE_IDLE (1<<27)
+#define NGX_HTTP_UPSTREAM_FAIR_WEIGHT_MODE_PEAK (1<<28)
+#define NGX_HTTP_UPSTREAM_FAIR_WEIGHT_MODE_MASK ((1<<27) | (1<<28))
+
+enum { WM_DEFAULT = 0, WM_IDLE, WM_PEAK };
 
 struct ngx_http_upstream_fair_peers_s {
     ngx_cycle_t                        *cycle;
@@ -59,7 +64,7 @@ struct ngx_http_upstream_fair_peers_s {
     ngx_uint_t                          current;
     ngx_uint_t                          size_err:1;
     ngx_uint_t                          no_rr:1;
-
+    ngx_uint_t                          weight_mode:2;
     ngx_uint_t                          number;
     ngx_str_t                          *name;
     ngx_http_upstream_fair_peers_t     *next;           /* for backup peers support, not really used yet */
@@ -369,8 +374,20 @@ ngx_http_upstream_fair(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     for (i = 1; i < cf->args->nelts; i++) {
         ngx_str_t *value = cf->args->elts;
-        if (ngx_strcmp(value[i].data, "no-rr") == 0) {
+        if (ngx_strcmp(value[i].data, "no_rr") == 0) {
             extra_peer_flags |= NGX_HTTP_UPSTREAM_FAIR_NO_RR;
+        } else if (ngx_strcmp(value[i].data, "weight_mode=peak") == 0) {
+            if (extra_peer_flags & NGX_HTTP_UPSTREAM_FAIR_WEIGHT_MODE_MASK) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "weight_mode= options are mutually exclusive");
+                return NGX_CONF_ERROR;
+            }
+            extra_peer_flags |= NGX_HTTP_UPSTREAM_FAIR_WEIGHT_MODE_PEAK;
+        } else if (ngx_strcmp(value[i].data, "weight_mode=idle") == 0) {
+            if (extra_peer_flags & NGX_HTTP_UPSTREAM_FAIR_WEIGHT_MODE_MASK) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "weight_mode= options are mutually exclusive");
+                return NGX_CONF_ERROR;
+            }
+            extra_peer_flags |= NGX_HTTP_UPSTREAM_FAIR_WEIGHT_MODE_IDLE;
         } else {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "Invalid `fair' parameter `%V'", &value[i]);
             return NGX_CONF_ERROR;
@@ -606,6 +623,11 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     if (us->flags & NGX_HTTP_UPSTREAM_FAIR_NO_RR) {
         peers->no_rr = 1;
     }
+    if (us->flags & NGX_HTTP_UPSTREAM_FAIR_WEIGHT_MODE_IDLE) {
+        peers->weight_mode = WM_IDLE;
+    } else if (us->flags & NGX_HTTP_UPSTREAM_FAIR_WEIGHT_MODE_PEAK) {
+        peers->weight_mode = WM_PEAK;
+    }
     peers->size_err = 0;
 
     us->peer.init = ngx_http_upstream_init_fair_peer;
@@ -677,8 +699,7 @@ ngx_http_upstream_fair_sched_score(ngx_peer_connection_t *pc,
 static ngx_int_t
 ngx_http_upstream_fair_try_peer(ngx_peer_connection_t *pc,
     ngx_http_upstream_fair_peer_data_t *fp,
-    ngx_uint_t peer_id,
-    time_t now)
+    ngx_uint_t peer_id)
 {
     ngx_http_upstream_fair_peer_t        *peer;
 
@@ -692,9 +713,9 @@ ngx_http_upstream_fair_try_peer(ngx_peer_connection_t *pc,
             return NGX_OK;
         }
 
-        if (now - peer->accessed > peer->fail_timeout) {
+        if (ngx_time() - peer->accessed > peer->fail_timeout) {
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] resetting fail count for peer %d, time delta %d > %d",
-                peer_id, now - peer->accessed, peer->fail_timeout);
+                peer_id, ngx_time() - peer->accessed, peer->fail_timeout);
             peer->shared->fails = 0;
             return NGX_OK;
         }
@@ -703,18 +724,127 @@ ngx_http_upstream_fair_try_peer(ngx_peer_connection_t *pc,
     return NGX_BUSY;
 }
 
+static ngx_uint_t
+ngx_http_upstream_choose_fair_peer_idle(ngx_peer_connection_t *pc,
+    ngx_http_upstream_fair_peer_data_t *fp)
+{
+    ngx_uint_t                          i, n;
+    ngx_uint_t                          npeers = fp->peers->number;
+    ngx_uint_t                          weight_mode = fp->peers->weight_mode;
+    ngx_uint_t                          best_idx = NGX_PEER_INVALID;
+    ngx_uint_t                          best_nreq = ~0U;
+
+    for (i = 0, n = fp->current; i < npeers; i++, n = (n + 1) % npeers) {
+        ngx_uint_t nreq = fp->peers->peer[n].shared->nreq;
+        ngx_uint_t weight = fp->peers->peer[n].weight;
+
+        if (fp->peers->peer[n].shared->fails > 0)
+            continue;
+
+        if (nreq >= weight || (nreq > 0 && weight_mode != WM_IDLE)) {
+            continue;
+        }
+
+        if (ngx_http_upstream_fair_try_peer(pc, fp, n) != NGX_OK) {
+            continue;
+        }
+
+        /* not in WM_IDLE+no_rr mode: the first completely idle backend gets chosen */
+        if (weight_mode != WM_IDLE && !fp->peers->no_rr) {
+            best_idx = n;
+            break;
+        }
+
+        /* in WM_IDLE+no_rr mode we actually prefer slightly loaded backends
+         * to totally idle ones, under the assumption that they're spawned
+         * on demand and can handle up to 'weight' concurrent requests
+         */
+        if (best_idx == NGX_PEER_INVALID || nreq) {
+            if (best_nreq <= nreq) {
+                continue;
+            }
+            best_idx = n;
+            best_nreq = nreq;
+        }
+    }
+
+    return best_idx;
+}
+
+static ngx_int_t
+ngx_http_upstream_choose_fair_peer_busy(ngx_peer_connection_t *pc,
+    ngx_http_upstream_fair_peer_data_t *fp)
+{
+    ngx_uint_t                          i, n;
+    ngx_uint_t                          npeers = fp->peers->number;
+    ngx_uint_t                          weight_mode = fp->peers->weight_mode;
+    ngx_uint_t                          best_idx = NGX_PEER_INVALID;
+    ngx_uint_t                          sched_score;
+    ngx_uint_t                          best_sched_score = ~0U;
+
+    /*
+     * calculate sched scores for all the peers, choosing the lowest one
+     */
+    for (i = 0, n = fp->current; i < npeers; i++, n = (n + 1) % npeers) {
+        ngx_http_upstream_fair_peer_t      *peer;
+        ngx_uint_t                          nreq;
+        ngx_uint_t                          weight;
+
+        peer = &fp->peers->peer[n];
+        nreq = fp->peers->peer[n].shared->nreq;
+
+        if (weight_mode == WM_PEAK && nreq >= peer->weight) {
+            ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] backend %d has nreq %ui >= weight %ui in WM_PEAK mode", n, nreq, peer->weight);
+            continue;
+        }
+
+        if (ngx_http_upstream_fair_try_peer(pc, fp, n) != NGX_OK) {
+            if (!pc->tries) {
+                ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] all backends exhausted");
+                return NGX_PEER_INVALID;
+            }
+
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] backend %d already tried", n);
+            continue;
+        }
+
+        sched_score = ngx_http_upstream_fair_sched_score(pc, fp, n);
+
+        if (weight_mode == WM_DEFAULT) {
+            /*
+             * take peer weight into account
+             */
+            weight = peer->shared->current_weight;
+            if (peer->max_fails) {
+                ngx_uint_t mf = peer->max_fails;
+                weight = peer->shared->current_weight * (mf - peer->shared->fails) / mf;
+            }
+            if (weight > 0) {
+                sched_score /= weight;
+            }
+            ngx_log_debug8(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] bss = %ui, ss = %ui (n = %d, w = %d/%d, f = %d/%d, weight = %d)",
+                best_sched_score, sched_score, n, peer->shared->current_weight, peer->weight, peer->shared->fails, peer->max_fails, weight);
+        }
+
+        if (sched_score <= best_sched_score) {
+            best_idx = n;
+            best_sched_score = sched_score;
+        }
+    }
+
+    return best_idx;
+}
+
 static ngx_int_t
 ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
     ngx_http_upstream_fair_peer_data_t *fp, ngx_uint_t *peer_id)
 {
-    ngx_uint_t                          i, n;
     ngx_uint_t                          npeers;
-    ngx_http_upstream_fair_shared_t     fsc;
-    time_t                              now;
-    ngx_uint_t                          best_sched_score = UINT_MAX, sched_score;
-    ngx_http_upstream_fair_peer_t      *peer;
+    ngx_uint_t                          best_idx = NGX_PEER_INVALID;
+    ngx_uint_t                          weight_mode;
 
     npeers = fp->peers->number;
+    weight_mode = fp->peers->weight_mode;
 
     /* just a single backend */
     if (npeers == 1) {
@@ -722,68 +852,34 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
         return NGX_OK;
     }
 
-    now = ngx_time();
-
     /* any idle backends? */
-    for (i = 0, n = fp->current; i < npeers; i++, n = (n + 1) % npeers) {
-        if (fp->peers->peer[n].shared->nreq == 0 &&
-            fp->peers->peer[n].shared->fails == 0 &&
-            ngx_http_upstream_fair_try_peer(pc, fp, n, now) == NGX_OK) {
-
-            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] peer %i is idle", n);
-            *peer_id = n;
-            return NGX_OK;
-        }
+    best_idx = ngx_http_upstream_choose_fair_peer_idle(pc, fp);
+    if (best_idx != NGX_PEER_INVALID) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] peer %i is idle", best_idx);
+        goto chosen;
     }
 
-    /*
-     * calculate sched scores for all the peers, choosing the lowest one
-     */
-    for (i = 0; i < npeers; i++, n = (n + 1) % npeers) {
-        ngx_uint_t weight;
-
-        if (ngx_http_upstream_fair_try_peer(pc, fp, n, now) != NGX_OK) {
-            if (!pc->tries) {
-                ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] all backends exhausted");
-                return NGX_BUSY;
-            }
-
-            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] backend %d already tried", n);
-            continue;
-        }
-
-        peer = &fp->peers->peer[n];
-        fsc = *peer->shared;
-        sched_score = ngx_http_upstream_fair_sched_score(pc, fp, n);
-
-        /*
-         * take peer weight into account
-         */
-        weight = peer->shared->current_weight;
-        if (peer->max_fails) {
-            ngx_uint_t mf = peer->max_fails;
-            weight = peer->shared->current_weight * (mf - peer->shared->fails) / mf;
-        }
-        if (weight > 0) {
-            sched_score /= weight;
-        }
-
-        ngx_log_debug8(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] bss = %ui, ss = %ui (n = %d, w = %d/%d, f = %d/%d, weight = %d)",
-            best_sched_score, sched_score, n, peer->shared->current_weight, peer->weight, peer->shared->fails, peer->max_fails, weight);
-
-        if (sched_score <= best_sched_score) {
-            *peer_id = n;
-            best_sched_score = sched_score;
-        }
+    /* no idle backends, choose the least loaded one */
+    best_idx = ngx_http_upstream_choose_fair_peer_busy(pc, fp);
+    if (best_idx != NGX_PEER_INVALID) {
+        goto chosen;
     }
 
-    peer = &fp->peers->peer[*peer_id];
-    ngx_bitvector_set(fp->tried, *peer_id);
-    if (peer->shared->current_weight-- == 0) {
-        peer->shared->current_weight = peer->weight;
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] peer %d expired weight, reset to %d", n, peer->weight);
-    }
+    return NGX_BUSY;
 
+chosen:
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] chose peer %i", best_idx);
+    *peer_id = best_idx;
+    ngx_bitvector_set(fp->tried, best_idx);
+
+    if (weight_mode == WM_DEFAULT) {
+        ngx_http_upstream_fair_peer_t      *peer = &fp->peers->peer[best_idx];
+
+        if (peer->shared->current_weight-- == 0) {
+            peer->shared->current_weight = peer->weight;
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] peer %d expired weight, reset to %d", best_idx, peer->weight);
+        }
+    }
     return NGX_OK;
 }
 
