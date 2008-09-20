@@ -1132,6 +1132,9 @@ ngx_http_upstream_fair_walk_status(ngx_pool_t *pool, ngx_chain_t *cl, ngx_int_t 
 
     if (node->left != sentinel) {
         ngx_http_upstream_fair_walk_status(pool, cl, length, node->left, sentinel);
+        if (cl->next) {
+            cl = cl->next;
+        }
     }
 
     size = 200 + s_node->peers->number * 120; /* LOTS of slack */
@@ -1172,6 +1175,7 @@ ngx_http_upstream_fair_walk_status(ngx_pool_t *pool, ngx_chain_t *cl, ngx_int_t 
         cl->buf->last_buf = 0;
     }
 
+    cl = cl->next;
 next:
 
     if (node->right != sentinel) {
