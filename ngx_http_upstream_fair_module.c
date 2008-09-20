@@ -10,11 +10,11 @@
 #include <ngx_http.h>
 
 typedef struct {
-    ngx_atomic_t                        nreq;
-    ngx_atomic_t                        total_req;
-    ngx_atomic_t                        last_req_id;
-    ngx_atomic_t                        fails;
-    ngx_atomic_t                        current_weight;
+    ngx_uint_t                          nreq;
+    ngx_uint_t                          total_req;
+    ngx_uint_t                          last_req_id;
+    ngx_uint_t                          fails;
+    ngx_uint_t                          current_weight;
 } ngx_http_upstream_fair_shared_t;
 
 typedef struct ngx_http_upstream_fair_peers_s ngx_http_upstream_fair_peers_t;
@@ -726,7 +726,7 @@ ngx_http_upstream_choose_fair_peer(ngx_peer_connection_t *pc,
 
     /* any idle backends? */
     for (i = 0, n = fp->current; i < npeers; i++, n = (n + 1) % npeers) {
-        if (ngx_atomic_fetch_add(&fp->peers->peer[n].shared->nreq, 0) == 0 &&
+        if (fp->peers->peer[n].shared->nreq == 0 &&
             fp->peers->peer[n].shared->fails == 0 &&
             ngx_http_upstream_fair_try_peer(pc, fp, n, now) == NGX_OK) {
 
@@ -831,7 +831,7 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
 
     peer->shared->last_req_id = fp->peers->shared->total_requests;
     ngx_http_upstream_fair_update_nreq(fp, 1, pc->log);
-    ngx_atomic_fetch_add(&peer->shared->total_req, 1);
+    peer->shared->total_req++;
     ngx_spinlock_unlock(lock);
     return ret;
 }
