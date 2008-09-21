@@ -21,7 +21,7 @@ typedef struct ngx_http_upstream_fair_peers_s ngx_http_upstream_fair_peers_t;
 
 typedef struct {
     ngx_rbtree_node_t                   node;
-    ngx_cycle_t                        *cycle;
+    uintptr_t                           cycle;
     ngx_http_upstream_fair_peers_t     *peers;      /* forms a unique cookie together with cycle */
     ngx_int_t                           refcount;   /* accessed only under shmtx_lock */
     ngx_uint_t                          total_requests;
@@ -59,7 +59,6 @@ typedef struct {
 enum { WM_DEFAULT = 0, WM_IDLE, WM_PEAK };
 
 struct ngx_http_upstream_fair_peers_s {
-    ngx_cycle_t                        *cycle;
     ngx_http_upstream_fair_shm_block_t *shared;
     ngx_uint_t                          current;
     ngx_uint_t                          size_err:1;
@@ -84,7 +83,6 @@ typedef struct {
 } ngx_http_upstream_fair_peer_data_t;
 
 
-static ngx_int_t ngx_http_upstream_fair_init_module(ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_upstream_init_fair(ngx_conf_t *cf,
     ngx_http_upstream_srv_conf_t *us);
 static ngx_int_t ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc,
@@ -617,7 +615,6 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     }
     ngx_http_upstream_fair_shm_zone->init = ngx_http_upstream_fair_init_shm_zone;
 
-    peers->cycle = cf->cycle;
     peers->shared = NULL;
     peers->current = n - 1;
     if (us->flags & NGX_HTTP_UPSTREAM_FAIR_NO_RR) {
@@ -982,7 +979,7 @@ ngx_http_upstream_fair_walk_shm(
     ngx_slab_pool_t *shpool,
     ngx_rbtree_node_t *node,
     ngx_rbtree_node_t *sentinel,
-    ngx_cycle_t *cycle, ngx_http_upstream_fair_peers_t *peers)
+    ngx_http_upstream_fair_peers_t *peers)
 {
     ngx_http_upstream_fair_shm_block_t     *uf_node;
     ngx_http_upstream_fair_shm_block_t     *found_node = NULL;
@@ -995,7 +992,7 @@ ngx_http_upstream_fair_walk_shm(
     /* visit left node */
     if (node->left != sentinel) {
         tmp_node = ngx_http_upstream_fair_walk_shm(shpool, node->left,
-            sentinel, cycle, peers);
+            sentinel, peers);
         if (tmp_node) {
             found_node = tmp_node;
         }
@@ -1004,7 +1001,7 @@ ngx_http_upstream_fair_walk_shm(
     /* visit right node */
     if (node->right != sentinel) {
         tmp_node = ngx_http_upstream_fair_walk_shm(shpool, node->right,
-            sentinel, cycle, peers);
+            sentinel, peers);
         if (tmp_node) {
             found_node = tmp_node;
         }
@@ -1012,7 +1009,7 @@ ngx_http_upstream_fair_walk_shm(
 
     /* visit current node */
     uf_node = (ngx_http_upstream_fair_shm_block_t *) node;
-    if (uf_node->cycle != cycle) {
+    if (uf_node->cycle != (uintptr_t) ngx_cycle) {
         if (--uf_node->refcount == 0) {
             ngx_rbtree_delete(ngx_http_upstream_fair_rbtree, node);
             ngx_slab_free_locked(shpool, node);
@@ -1041,7 +1038,7 @@ ngx_http_upstream_fair_shm_alloc(ngx_http_upstream_fair_peers_t *usfp, ngx_log_t
     usfp->shared = ngx_http_upstream_fair_walk_shm(shpool,
         ngx_http_upstream_fair_rbtree->root,
         ngx_http_upstream_fair_rbtree->sentinel,
-        usfp->cycle, usfp);
+        usfp);
 
     if (usfp->shared) {
         usfp->shared->refcount++;
@@ -1064,12 +1061,15 @@ ngx_http_upstream_fair_shm_alloc(ngx_http_upstream_fair_peers_t *usfp, ngx_log_t
         return NGX_ERROR;
     }
 
-    usfp->shared->node.key = ngx_crc32_short((u_char *) &usfp->cycle, sizeof usfp->cycle) ^
+    usfp->shared->node.key = ngx_crc32_short((u_char *) &ngx_cycle, sizeof ngx_cycle) ^
         ngx_crc32_short((u_char *) &usfp, sizeof(usfp));
 
-    usfp->shared->refcount = 1;
-    usfp->shared->cycle = usfp->cycle;
+    /* we're casting away 'volatile' here which is fine because
+     * we don't expect any single value to ever change
+     */
+    usfp->shared->cycle = (uintptr_t) ngx_cycle;
     usfp->shared->peers = usfp;
+    usfp->shared->refcount = 1;
     usfp->shared->total_requests = 0;
 
     for (i = 0; i < usfp->number; i++) {
@@ -1233,7 +1233,7 @@ ngx_http_upstream_fair_walk_status(ngx_pool_t *pool, ngx_chain_t *cl, ngx_int_t 
         }
     }
 
-    if (s_node->cycle != ngx_cycle) {
+    if (s_node->cycle != (uintptr_t) ngx_cycle) {
         goto next;
     }
 
