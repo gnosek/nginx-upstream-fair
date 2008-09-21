@@ -23,7 +23,7 @@ typedef struct {
     ngx_rbtree_node_t                   node;
     ngx_uint_t                          generation;
     uintptr_t                           peers;      /* forms a unique cookie together with generation */
-    ngx_int_t                           refcount;   /* accessed only under shmtx_lock */
+    ngx_uint_t                          total_nreq;
     ngx_uint_t                          total_requests;
     ngx_atomic_t                        lock;
     ngx_http_upstream_fair_shared_t     stats[1];
@@ -645,10 +645,16 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
 static void
 ngx_http_upstream_fair_update_nreq(ngx_http_upstream_fair_peer_data_t *fp, int delta, ngx_log_t *log)
 {
-    ngx_uint_t                           nreq;
+    ngx_uint_t                          nreq;
+    ngx_uint_t                          total_nreq;
 
     nreq = (fp->peers->peer[fp->current].shared->nreq += delta);
-    ngx_log_debug4(NGX_LOG_DEBUG_HTTP, log, 0, "[upstream_fair] nreq for peer %ui @ %p/%p now %d", fp->current, fp->peers, fp->peers->peer[fp->current].shared, nreq);
+    total_nreq = (fp->peers->shared->total_nreq += delta);
+
+    ngx_log_debug6(NGX_LOG_DEBUG_HTTP, log, 0,
+        "[upstream_fair] nreq for peer %ui @ %p/%p now %d, total %d, delta %d",
+        fp->current, fp->peers, fp->peers->peer[fp->current].shared, nreq,
+        total_nreq, delta);
 }
 
 /*
@@ -1019,10 +1025,13 @@ ngx_http_upstream_fair_walk_shm(
     /* visit current node */
     uf_node = (ngx_http_upstream_fair_shm_block_t *) node;
     if (uf_node->generation != ngx_http_upstream_fair_generation) {
-        if (--uf_node->refcount == 0) {
+        ngx_spinlock(&uf_node->lock, ngx_pid, 1024);
+        if (uf_node->total_nreq == 0) {
+            /* don't bother unlocking */
             ngx_rbtree_delete(ngx_http_upstream_fair_rbtree, node);
             ngx_slab_free_locked(shpool, node);
         }
+        ngx_spinlock_unlock(&uf_node->lock);
     } else if (uf_node->peers == (uintptr_t) peers) {
         found_node = uf_node;
     }
@@ -1050,7 +1059,6 @@ ngx_http_upstream_fair_shm_alloc(ngx_http_upstream_fair_peers_t *usfp, ngx_log_t
         usfp);
 
     if (usfp->shared) {
-        usfp->shared->refcount++;
         ngx_shmtx_unlock(&shpool->mutex);
         return NGX_OK;
     }
@@ -1075,7 +1083,7 @@ ngx_http_upstream_fair_shm_alloc(ngx_http_upstream_fair_peers_t *usfp, ngx_log_t
 
     usfp->shared->generation = ngx_http_upstream_fair_generation;
     usfp->shared->peers = (uintptr_t) usfp;
-    usfp->shared->refcount = 1;
+    usfp->shared->total_nreq = 0;
     usfp->shared->total_requests = 0;
 
     for (i = 0; i < usfp->number; i++) {
