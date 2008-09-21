@@ -642,7 +642,7 @@ ngx_http_upstream_fair_update_nreq(ngx_http_upstream_fair_peer_data_t *fp, int d
     ngx_uint_t                           nreq;
 
     nreq = (fp->peers->peer[fp->current].shared->nreq += delta);
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0, "[upstream_fair] nreq for peer %ui now %d", fp->current, nreq);
+    ngx_log_debug4(NGX_LOG_DEBUG_HTTP, log, 0, "[upstream_fair] nreq for peer %ui @ %p/%p now %d", fp->current, fp->peers, fp->peers->peer[fp->current].shared, nreq);
 }
 
 /*
@@ -685,7 +685,7 @@ ngx_http_upstream_fair_sched_score(ngx_peer_connection_t *pc,
         return SCHED_SCORE(0, req_delta);
     }
 
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] nreq = %i, req_delta = %ui", fs->nreq, req_delta);
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] peer %ui: nreq = %i, req_delta = %ui", n, fs->nreq, req_delta);
 
     return SCHED_SCORE(
         ngx_upstream_fair_min(fs->nreq, SCHED_NREQ_MAX),
@@ -898,7 +898,7 @@ ngx_http_upstream_get_fair_peer(ngx_peer_connection_t *pc, void *data)
     lock = &fp->peers->shared->lock;
     ngx_spinlock(lock, ngx_pid, 1024);
     ret = ngx_http_upstream_choose_fair_peer(pc, fp, &peer_id);
-    ngx_log_debug(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] fp->current = %d, peer_id = %d, ret = %d",
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_fair] fp->current = %d, peer_id = %d, ret = %d",
         fp->current, peer_id, ret);
 
     if (pc)
