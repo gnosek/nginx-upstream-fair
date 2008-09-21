@@ -1233,6 +1233,15 @@ ngx_http_upstream_fair_walk_status(ngx_pool_t *pool, ngx_chain_t *cl, ngx_int_t 
         }
     }
 
+    if (s_node->cycle != ngx_cycle) {
+        goto next;
+    }
+
+    peers = s_node->peers;
+    if (!peers->shared) {
+        goto next;
+    }
+
     size = 200 + s_node->peers->number * 120; /* LOTS of slack */
 
     b = ngx_create_temp_buf(pool, size);
@@ -1249,15 +1258,10 @@ ngx_http_upstream_fair_walk_status(ngx_pool_t *pool, ngx_chain_t *cl, ngx_int_t 
     new_cl->next = NULL;
     cl->next = new_cl;
 
-    peers = s_node->peers;
-
     b->last = ngx_sprintf(b->last, "upstream %V (%p): current peer %d/%d, total requests: %ui\n", peers->name, (void*) node, peers->current, peers->number, s_node->total_requests);
     for (i = 0; i < peers->number; i++) {
         ngx_http_upstream_fair_peer_t *peer = &peers->peer[i];
         ngx_http_upstream_fair_shared_t *sh = peer->shared;
-        if (!sh) {
-            continue;
-        }
         b->last = ngx_sprintf(b->last, " peer %d: %V weight: %d/%d, fails: %d/%d, acc: %d, down: %d, nreq: %d, total_req: %ui, last_req: %ui\n",
             i, &peer->name, sh->current_weight, peer->weight, sh->fails, peer->max_fails, peer->accessed, peer->down,
             sh->nreq, sh->total_req, sh->last_req_id);
