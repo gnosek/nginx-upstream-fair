@@ -21,8 +21,8 @@ typedef struct ngx_http_upstream_fair_peers_s ngx_http_upstream_fair_peers_t;
 
 typedef struct {
     ngx_rbtree_node_t                   node;
-    uintptr_t                           cycle;
-    uintptr_t                           peers;      /* forms a unique cookie together with cycle */
+    ngx_uint_t                          generation;
+    uintptr_t                           peers;      /* forms a unique cookie together with generation */
     ngx_int_t                           refcount;   /* accessed only under shmtx_lock */
     ngx_uint_t                          total_requests;
     ngx_atomic_t                        lock;
@@ -95,6 +95,7 @@ static char *ngx_http_upstream_fair(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_upstream_fair_set_shm_size(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+static ngx_int_t ngx_http_upstream_fair_init_module(ngx_cycle_t *cycle);
 
 #if (NGX_HTTP_EXTENDED_STATUS)
 static ngx_chain_t *ngx_http_upstream_fair_report_status(ngx_http_request_t *r,
@@ -153,7 +154,7 @@ ngx_module_t  ngx_http_upstream_fair_module = {
     ngx_http_upstream_fair_commands,    /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
     NULL,                                  /* init master */
-    NULL,                                  /* init module */
+    ngx_http_upstream_fair_init_module,    /* init module */
     NULL,                                  /* init process */
     NULL,                                  /* init thread */
     NULL,                                  /* exit thread */
@@ -166,6 +167,7 @@ ngx_module_t  ngx_http_upstream_fair_module = {
 static ngx_uint_t ngx_http_upstream_fair_shm_size;
 static ngx_shm_zone_t * ngx_http_upstream_fair_shm_zone;
 static ngx_rbtree_t * ngx_http_upstream_fair_rbtree;
+static ngx_uint_t ngx_http_upstream_fair_generation;
 
 static int
 ngx_http_upstream_fair_compare_rbtree_node(const ngx_rbtree_node_t *v_left,
@@ -176,11 +178,11 @@ ngx_http_upstream_fair_compare_rbtree_node(const ngx_rbtree_node_t *v_left,
     left = (ngx_http_upstream_fair_shm_block_t *) v_left;
     right = (ngx_http_upstream_fair_shm_block_t *) v_right;
 
-    if (left->cycle < right->cycle) {
+    if (left->generation < right->generation) {
         return -1;
-    } else if (left->cycle > right->cycle) {
+    } else if (left->generation > right->generation) {
         return 1;
-    } else { /* left->cycle == right->cycle */
+    } else { /* left->generation == right->generation */
         if (left->peers < right->peers) {
             return -1;
         } else if (left->peers > right->peers) {
@@ -286,6 +288,13 @@ ngx_bitvector_set(uintptr_t *bv, ngx_uint_t bit)
 /*
  * generic functions end here
  */
+
+static ngx_int_t
+ngx_http_upstream_fair_init_module(ngx_cycle_t *cycle)
+{
+    ngx_http_upstream_fair_generation++;
+    return NGX_OK;
+}
 
 static void
 ngx_http_upstream_fair_rbtree_insert(ngx_rbtree_node_t *temp,
@@ -1009,7 +1018,7 @@ ngx_http_upstream_fair_walk_shm(
 
     /* visit current node */
     uf_node = (ngx_http_upstream_fair_shm_block_t *) node;
-    if (uf_node->cycle != (uintptr_t) ngx_cycle) {
+    if (uf_node->generation != ngx_http_upstream_fair_generation) {
         if (--uf_node->refcount == 0) {
             ngx_rbtree_delete(ngx_http_upstream_fair_rbtree, node);
             ngx_slab_free_locked(shpool, node);
@@ -1064,10 +1073,7 @@ ngx_http_upstream_fair_shm_alloc(ngx_http_upstream_fair_peers_t *usfp, ngx_log_t
     usfp->shared->node.key = ngx_crc32_short((u_char *) &ngx_cycle, sizeof ngx_cycle) ^
         ngx_crc32_short((u_char *) &usfp, sizeof(usfp));
 
-    /* we're casting away 'volatile' here which is fine because
-     * we don't expect any single value to ever change
-     */
-    usfp->shared->cycle = (uintptr_t) ngx_cycle;
+    usfp->shared->generation = ngx_http_upstream_fair_generation;
     usfp->shared->peers = (uintptr_t) usfp;
     usfp->shared->refcount = 1;
     usfp->shared->total_requests = 0;
@@ -1233,12 +1239,12 @@ ngx_http_upstream_fair_walk_status(ngx_pool_t *pool, ngx_chain_t *cl, ngx_int_t 
         }
     }
 
-    if (s_node->cycle != (uintptr_t) ngx_cycle) {
+    if (s_node->generation != ngx_http_upstream_fair_generation) {
         goto next;
     }
 
     /* this is rather ugly (casting an uintptr_t back into a pointer
-     * but as long as the cycle is still the same (verified above),
+     * but as long as the generation is still the same (verified above),
      * it should be still safe
      */
     peers = (ngx_http_upstream_fair_peers_t *) s_node->peers;
