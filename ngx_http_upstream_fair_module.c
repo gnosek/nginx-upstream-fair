@@ -22,7 +22,7 @@ typedef struct ngx_http_upstream_fair_peers_s ngx_http_upstream_fair_peers_t;
 typedef struct {
     ngx_rbtree_node_t                   node;
     uintptr_t                           cycle;
-    ngx_http_upstream_fair_peers_t     *peers;      /* forms a unique cookie together with cycle */
+    uintptr_t                           peers;      /* forms a unique cookie together with cycle */
     ngx_int_t                           refcount;   /* accessed only under shmtx_lock */
     ngx_uint_t                          total_requests;
     ngx_atomic_t                        lock;
@@ -1014,7 +1014,7 @@ ngx_http_upstream_fair_walk_shm(
             ngx_rbtree_delete(ngx_http_upstream_fair_rbtree, node);
             ngx_slab_free_locked(shpool, node);
         }
-    } else if (uf_node->peers == peers) {
+    } else if (uf_node->peers == (uintptr_t) peers) {
         found_node = uf_node;
     }
 
@@ -1068,7 +1068,7 @@ ngx_http_upstream_fair_shm_alloc(ngx_http_upstream_fair_peers_t *usfp, ngx_log_t
      * we don't expect any single value to ever change
      */
     usfp->shared->cycle = (uintptr_t) ngx_cycle;
-    usfp->shared->peers = usfp;
+    usfp->shared->peers = (uintptr_t) usfp;
     usfp->shared->refcount = 1;
     usfp->shared->total_requests = 0;
 
@@ -1237,13 +1237,16 @@ ngx_http_upstream_fair_walk_status(ngx_pool_t *pool, ngx_chain_t *cl, ngx_int_t 
         goto next;
     }
 
-    peers = s_node->peers;
+    /* this is rather ugly (casting an uintptr_t back into a pointer
+     * but as long as the cycle is still the same (verified above),
+     * it should be still safe
+     */
+    peers = (ngx_http_upstream_fair_peers_t *) s_node->peers;
     if (!peers->shared) {
         goto next;
     }
 
-    size = 200 + s_node->peers->number * 120; /* LOTS of slack */
-
+    size = 200 + peers->number * 120; /* LOTS of slack */
     b = ngx_create_temp_buf(pool, size);
     if (!b) {
         goto next;
