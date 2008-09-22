@@ -1242,25 +1242,24 @@ ngx_http_upstream_fair_walk_status(ngx_pool_t *pool, ngx_chain_t *cl, ngx_int_t 
 
     if (node->left != sentinel) {
         ngx_http_upstream_fair_walk_status(pool, cl, length, node->left, sentinel);
-        if (cl->next) {
-            cl = cl->next;
-        }
     }
 
     if (s_node->generation != ngx_http_upstream_fair_generation) {
-        goto next;
+        size = 100;
+        peers = NULL;
+    } else {
+        /* this is rather ugly (casting an uintptr_t back into a pointer
+         * but as long as the generation is still the same (verified above),
+         * it should be still safe
+         */
+        peers = (ngx_http_upstream_fair_peers_t *) s_node->peers;
+        if (!peers->shared) {
+            goto next;
+        }
+
+        size = 200 + peers->number * 120; /* LOTS of slack */
     }
 
-    /* this is rather ugly (casting an uintptr_t back into a pointer
-     * but as long as the generation is still the same (verified above),
-     * it should be still safe
-     */
-    peers = (ngx_http_upstream_fair_peers_t *) s_node->peers;
-    if (!peers->shared) {
-        goto next;
-    }
-
-    size = 200 + peers->number * 120; /* LOTS of slack */
     b = ngx_create_temp_buf(pool, size);
     if (!b) {
         goto next;
@@ -1273,15 +1272,23 @@ ngx_http_upstream_fair_walk_status(ngx_pool_t *pool, ngx_chain_t *cl, ngx_int_t 
 
     new_cl->buf = b;
     new_cl->next = NULL;
+
+    while (cl->next) {
+        cl = cl->next;
+    }
     cl->next = new_cl;
 
-    b->last = ngx_sprintf(b->last, "upstream %V (%p): current peer %d/%d, total requests: %ui\n", peers->name, (void*) node, peers->current, peers->number, s_node->total_requests);
-    for (i = 0; i < peers->number; i++) {
-        ngx_http_upstream_fair_peer_t *peer = &peers->peer[i];
-        ngx_http_upstream_fair_shared_t *sh = peer->shared;
-        b->last = ngx_sprintf(b->last, " peer %d: %V weight: %d/%d, fails: %d/%d, acc: %d, down: %d, nreq: %d, total_req: %ui, last_req: %ui\n",
-            i, &peer->name, sh->current_weight, peer->weight, sh->fails, peer->max_fails, peer->accessed, peer->down,
-            sh->nreq, sh->total_req, sh->last_req_id);
+    if (peers) {
+        b->last = ngx_sprintf(b->last, "upstream %V (%p): current peer %d/%d, total requests: %ui\n", peers->name, (void*) node, peers->current, peers->number, s_node->total_requests);
+        for (i = 0; i < peers->number; i++) {
+            ngx_http_upstream_fair_peer_t *peer = &peers->peer[i];
+            ngx_http_upstream_fair_shared_t *sh = peer->shared;
+            b->last = ngx_sprintf(b->last, " peer %d: %V weight: %d/%d, fails: %d/%d, acc: %d, down: %d, nreq: %d, total_req: %ui, last_req: %ui\n",
+                i, &peer->name, sh->current_weight, peer->weight, sh->fails, peer->max_fails, peer->accessed, peer->down,
+                sh->nreq, sh->total_req, sh->last_req_id);
+        }
+    } else {
+        b->last = ngx_sprintf(b->last, "upstream %p: gen %ui != %ui, total_nreq = %ui", (void*) node, s_node->generation, ngx_http_upstream_fair_generation, s_node->total_nreq);
     }
     b->last = ngx_sprintf(b->last, "\n");
     b->last_buf = 1;
@@ -1304,7 +1311,7 @@ static ngx_chain_t*
 ngx_http_upstream_fair_report_status(ngx_http_request_t *r, ngx_int_t *length)
 {
     ngx_buf_t              *b;
-    ngx_chain_t            *cl, *tree_cl;
+    ngx_chain_t            *cl;
     ngx_slab_pool_t        *shpool;
 
     b = ngx_create_temp_buf(r->pool, sizeof("\nupstream_fair status report:\n"));
@@ -1313,15 +1320,11 @@ ngx_http_upstream_fair_report_status(ngx_http_request_t *r, ngx_int_t *length)
     }
 
     cl = ngx_alloc_chain_link(r->pool);
-    tree_cl = ngx_alloc_chain_link(r->pool);
-    if (!cl || !tree_cl) {
+    if (!cl) {
         return NULL;
     }
-    cl->next = tree_cl;
+    cl->next = NULL;
     cl->buf = b;
-
-    tree_cl->next = NULL;
-    tree_cl->buf = NULL;
 
     b->last = ngx_cpymem(b->last, "\nupstream_fair status report:\n",
         sizeof("\nupstream_fair status report:\n") - 1);
@@ -1339,7 +1342,7 @@ ngx_http_upstream_fair_report_status(ngx_http_request_t *r, ngx_int_t *length)
 
     ngx_shmtx_unlock(&shpool->mutex);
 
-    if (!cl->next->buf) {
+    if (!cl->next || !cl->next->buf) {
         /* no upstream_fair status to report */
         return NULL;
     }
