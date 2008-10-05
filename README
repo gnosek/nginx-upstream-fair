@@ -8,6 +8,8 @@ The Nginx fair proxy balancer enhances the standard round-robin load balancer pr
 with Nginx so that it will track busy back end servers (e.g. Thin, Ebb, Mongrel)
 and balance the load to non-busy server processes.
 
+Further information can be found on http://nginx.localdomain.pl/
+
 Ezra Zygmuntowicz has a good writeup of the fair proxy load balancer and how to use it here:
 http://brainspl.at/articles/2007/11/09/a-fair-proxy-balancer-for-nginx-and-mongrel
 
@@ -36,6 +38,9 @@ upstream mongrel {
     server 127.0.0.1:5002;
   }
 
+
+If you encounter any issues, please report them using the bugtracker at
+http://nginx.localdomain.pl/
 
 Contributing:
 --
