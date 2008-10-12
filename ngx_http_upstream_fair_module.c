@@ -762,7 +762,7 @@ ngx_http_upstream_choose_fair_peer_idle(ngx_peer_connection_t *pc,
         }
 
         /* not in WM_IDLE+no_rr mode: the first completely idle backend gets chosen */
-        if (weight_mode != WM_IDLE && !fp->peers->no_rr) {
+        if (weight_mode != WM_IDLE || !fp->peers->no_rr) {
             best_idx = n;
             break;
         }
