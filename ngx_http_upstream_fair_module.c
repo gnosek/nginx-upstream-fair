@@ -792,7 +792,7 @@ ngx_http_upstream_choose_fair_peer_busy(ngx_peer_connection_t *pc,
     ngx_uint_t                          weight_mode = fp->peers->weight_mode;
     ngx_uint_t                          best_idx = NGX_PEER_INVALID;
     ngx_uint_t                          sched_score;
-    ngx_uint_t                          best_sched_score = ~0U;
+    ngx_uint_t                          best_sched_score = ~0UL;
 
     /*
      * calculate sched scores for all the peers, choosing the lowest one
