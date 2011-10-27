@@ -679,7 +679,7 @@ ngx_http_upstream_fair_update_nreq(ngx_http_upstream_fair_peer_data_t *fp, int d
 #define SCHED_COUNTER_BITS 20
 #define SCHED_NREQ_MAX ((~0UL) >> SCHED_COUNTER_BITS)
 #define SCHED_COUNTER_MAX ((1 << SCHED_COUNTER_BITS) - 1)
-#define SCHED_SCORE(nreq,delta) (((nreq) << SCHED_COUNTER_BITS) | (~(delta)))
+#define SCHED_SCORE(nreq,delta) (((nreq) << SCHED_COUNTER_BITS) | (~(delta) & SCHED_COUNTER_MAX))
 #define ngx_upstream_fair_min(a,b) (((a) < (b)) ? (a) : (b))
 
 static ngx_uint_t
