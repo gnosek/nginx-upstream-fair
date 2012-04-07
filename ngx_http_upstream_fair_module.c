@@ -610,7 +610,7 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     n = peers->number;
 
     shm_name = ngx_palloc(cf->pool, sizeof *shm_name);
-    shm_name->len = sizeof("upstream_fair");
+    shm_name->len = sizeof("upstream_fair") - 1;
     shm_name->data = (unsigned char *) "upstream_fair";
 
     if (ngx_http_upstream_fair_shm_size == 0) {
