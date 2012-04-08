@@ -645,18 +645,13 @@ ngx_http_upstream_init_fair(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
 static void
 ngx_http_upstream_fair_update_nreq(ngx_http_upstream_fair_peer_data_t *fp, int delta, ngx_log_t *log)
 {
-#if (NGX_DEBUG)
-    ngx_uint_t                          nreq;
-    ngx_uint_t                          total_nreq;
-
-    nreq = (fp->peers->peer[fp->current].shared->nreq += delta);
-    total_nreq = (fp->peers->shared->total_nreq += delta);
+    fp->peers->peer[fp->current].shared->nreq += delta;
+    fp->peers->shared->total_nreq += delta;
 
     ngx_log_debug6(NGX_LOG_DEBUG_HTTP, log, 0,
         "[upstream_fair] nreq for peer %ui @ %p/%p now %d, total %d, delta %d",
-        fp->current, fp->peers, fp->peers->peer[fp->current].shared, nreq,
-        total_nreq, delta);
-#endif
+        fp->current, fp->peers, fp->peers->peer[fp->current].shared,
+        fp->peers->peer[fp->current].shared->nreq, fp->peers->shared->total_nreq, delta);
 }
 
 /*
