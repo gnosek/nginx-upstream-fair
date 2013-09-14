@@ -1,8 +1,6 @@
-Nginx Upstream Fair Proxy Load Balancer
---
+# Nginx Upstream Fair Proxy Load Balancer
 
-Description:
---
+## Description:
 
 The Nginx fair proxy balancer enhances the standard round-robin load balancer provided
 with Nginx so that it will track busy back end servers (e.g. Thin, Ebb, Mongrel)
@@ -14,35 +12,37 @@ Ezra Zygmuntowicz has a good writeup of the fair proxy load balancer and how to 
 http://brainspl.at/articles/2007/11/09/a-fair-proxy-balancer-for-nginx-and-mongrel
 
 
-Installation:
---
+## Installation:
 
 You'll need to re-compile Nginx from source to include this module.
 Modify your compile of Nginx by adding the following directive
 (modified to suit your path of course):
 
+```bash
 ./configure --with-http_ssl_module --add-module=/absolute/path/to/nginx-upstream-fair
 make
 make install
+```
 
 
-Usage:
+## Usage:
 --
 
 Change your Nginx config file's upstream block to include the 'fair' directive:
 
+```nginx
 upstream mongrel {
     fair;
     server 127.0.0.1:5000;
     server 127.0.0.1:5001;
     server 127.0.0.1:5002;
   }
-
+```
 
 If you encounter any issues, please report them using the bugtracker at
 http://nginx.localdomain.pl/
 
-Contributing:
+## Contributing:
 --
 
 Git source repositories:
