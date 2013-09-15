@@ -8,12 +8,6 @@ The Nginx fair proxy balancer enhances the standard round-robin load balancer pr
 with Nginx so that it will track busy back end servers (e.g. Thin, Ebb, Mongrel)
 and balance the load to non-busy server processes.
 
-Further information can be found on http://nginx.localdomain.pl/
-
-Ezra Zygmuntowicz has a good writeup of the fair proxy load balancer and how to use it here:
-http://brainspl.at/articles/2007/11/09/a-fair-proxy-balancer-for-nginx-and-mongrel
-
-
 Installation
 -------
 
@@ -62,15 +56,12 @@ Usage
 Change your Nginx config file's upstream block to include the 'fair' directive:
 
 
-If you encounter any issues, please report them using the bugtracker at
-http://nginx.localdomain.pl/
+If you encounter any issues, please report them using the [bugtracker](https://github.com/gnosek/nginx-upstream-fair/issues)
 
 Contributing
 -------
 
-Git source repositories:
-http://github.com/gnosek/nginx-upstream-fair/tree/master
-http://git.localdomain.pl/?p=nginx-upstream-fair.git;a=summary
+Git [source repository](http://github.com/gnosek/nginx-upstream-fair/tree/master)
 
 Please feel free to fork the project at GitHub and submit pull requests or patches.
 
