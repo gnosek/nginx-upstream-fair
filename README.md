@@ -37,7 +37,32 @@ upstream mongrel {
     server 127.0.0.1:5001;
     server 127.0.0.1:5002;
   }
+upstream backend {
+  server server1;
+  server server2;
+  fair;
+}
+
 ```
+===
+**fair**
+**syntax** fair
+
+**context** upstream
+
+Enables fairness.
+
+
+**upstream_fair_shm_size**
+**syntax** upstream_fair_shm_size size
+
+**default** upstream_fair_shm_size 32k
+
+**context** main
+
+Size of the shared memory for storing information about the busy-ness of backends. Defaults to 8 pages (so 32k on most systems).
+
+====
 
 If you encounter any issues, please report them using the bugtracker at
 http://nginx.localdomain.pl/
