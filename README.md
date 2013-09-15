@@ -1,6 +1,8 @@
-# Nginx Upstream Fair Proxy Load Balancer
+Nginx Upstream Fair Proxy Load Balancer
+============
 
-## Description:
+Description
+-------
 
 The Nginx fair proxy balancer enhances the standard round-robin load balancer provided
 with Nginx so that it will track busy back end servers (e.g. Thin, Ebb, Mongrel)
@@ -12,7 +14,8 @@ Ezra Zygmuntowicz has a good writeup of the fair proxy load balancer and how to 
 http://brainspl.at/articles/2007/11/09/a-fair-proxy-balancer-for-nginx-and-mongrel
 
 
-## Installation:
+Installation
+-------
 
 You'll need to re-compile Nginx from source to include this module.
 Modify your compile of Nginx by adding the following directive
@@ -25,50 +28,45 @@ make install
 ```
 
 
-## Usage:
---
+Configuration
+-------
+*Example*
+
+    upstream mongrel {
+        fair;
+        server server1;
+        server server2;
+        server server3;
+    }
+
+The module supports a number of configuration directives:
+* syntax: **fair**
+
+  context: upstream
+
+  Enables fairness.
+
+
+* syntax: **upstream_fair_shm_size \<size\>;**
+  
+  context: main
+
+  default: upstream_fair_shm_size 32k
+
+  Size of the shared memory for storing information about the busy-ness of backends. Defaults to 8 pages
+  (so 32k on most systems).
+
+Usage
+-------
 
 Change your Nginx config file's upstream block to include the 'fair' directive:
 
-```nginx
-upstream mongrel {
-    fair;
-    server 127.0.0.1:5000;
-    server 127.0.0.1:5001;
-    server 127.0.0.1:5002;
-  }
-upstream backend {
-  server server1;
-  server server2;
-  fair;
-}
-
-```
-===
-**fair**
-**syntax** fair
-
-**context** upstream
-
-Enables fairness.
-
-
-**upstream_fair_shm_size**
-**syntax** upstream_fair_shm_size size
-
-**default** upstream_fair_shm_size 32k
-
-**context** main
-
-Size of the shared memory for storing information about the busy-ness of backends. Defaults to 8 pages (so 32k on most systems).
-
-====
 
 If you encounter any issues, please report them using the bugtracker at
 http://nginx.localdomain.pl/
 
-## Contributing:
---
+Contributing
+-------
 
 Git source repositories:
 http://github.com/gnosek/nginx-upstream-fair/tree/master
