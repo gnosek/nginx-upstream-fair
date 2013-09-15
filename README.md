@@ -26,7 +26,7 @@ Configuration
 -------
 *Example*
 
-    upstream mongrel {
+    upstream backend {
         fair;
         server server1;
         server server2;
