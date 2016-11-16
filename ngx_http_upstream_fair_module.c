@@ -540,7 +540,11 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
 
     /* an upstream implicitly defined by proxy_pass, etc. */
 
+#if nginx_version < 1011006
     if (us->port == 0 && us->default_port == 0) {
+#else
+    if (us->port == 0) {
+#endif
         ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
                       "no port in upstream \"%V\" in %s:%ui",
                       &us->host, us->file_name, us->line);
@@ -550,8 +554,11 @@ ngx_http_upstream_init_fair_rr(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     ngx_memzero(&u, sizeof(ngx_url_t));
 
     u.host = us->host;
+#if nginx_version < 1011006
     u.port = (in_port_t) (us->port ? us->port : us->default_port);
-
+#else
+    u.port = (in_port_t) us->port;
+#endif
     if (ngx_inet_resolve_host(cf->pool, &u) != NGX_OK) {
         if (u.err) {
             ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
